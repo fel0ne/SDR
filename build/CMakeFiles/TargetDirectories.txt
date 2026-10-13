@@ -1,0 +1,3 @@
+/home/felone/dev/SDR/build/CMakeFiles/main.dir
+/home/felone/dev/SDR/build/CMakeFiles/edit_cache.dir
+/home/felone/dev/SDR/build/CMakeFiles/rebuild_cache.dir
