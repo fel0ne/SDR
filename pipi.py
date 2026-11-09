@@ -1,97 +1,100 @@
+# Просмотр BPSK: что отправили и что приняли.
+# Запуск из папки build:
+#   python3 bpsk_view.py                          # tx_sent.pcm -> rx_recv.pcm (800 МГц)
+#   python3 bpsk_view.py rx_sent.pcm tx_recv.pcm  # обратное направление (840 МГц)
 import os
-import matplotlib.pyplot as plt
+import sys
 import numpy as np
+import matplotlib.pyplot as plt
 from scipy import signal
 
+SENT_FILE = sys.argv[1] if len(sys.argv) > 1 else "recorded_data/BPSK/tx_sent.pcm"
+RECV_FILE = sys.argv[2] if len(sys.argv) > 2 else "recorded_data/BPSK/rx_recv.pcm"
+SAMPLE_RATE = 1e6
+SHOW = 50000   # сколько отсчетов показать во времени (1.5 мс)
+BLOCK = 1920  # размер буфера в C-коде
+SPS = 10      # отсчетов на символ (как в main.c)
+EST_LEN = 50000  # сколько отсчетов брать для оценки сдвига частоты
 
-pcm_filename = "build/tx_recv.pcm"  
-sample_rate = 1e6 
 
-if not os.path.exists(pcm_filename):
-    print(f"Ошибка: Файл '{pcm_filename}' не найден!")
-    exit(1)
+def read_iq(name):
+    if not os.path.exists(name):
+        print(f"Ошибка: файл '{name}' не найден")
+        sys.exit(1)
+    raw = np.fromfile(name, dtype=np.int16)
+    raw = raw[: len(raw) // 2 * 2].astype(np.float32)
+    return raw[0::2], raw[1::2]
 
-raw_data = np.fromfile(pcm_filename, dtype=np.int16)
-if len(raw_data) == 0:
-    print("Ошибка: Файл пустой!")
-    exit(1)
 
-rx_i = raw_data[0::2].astype(np.float32)
-rx_q = raw_data[1::2].astype(np.float32)
+tx_i, tx_q = read_iq(SENT_FILE)
+rx_i, rx_q = read_iq(RECV_FILE)
 
-rx_i -= np.mean(rx_i)
-rx_q -= np.mean(rx_q)
 
-rx_complex = rx_i + 1j * rx_q
-num_samples = len(rx_complex)
-print(f"Загружено сэмплов: {num_samples} ({(num_samples/sample_rate):.2f} секунд записи)")
+rx = rx_i + 1j * rx_q
 
-nperseg = 8192
-freqs, psd = signal.welch(rx_complex, fs=sample_rate, nperseg=nperseg, return_onesided=False)
+# Самый сильный участок приема (в начале другая плата могла еще не передавать)
+n_blocks = max(len(rx) // BLOCK, 1)
+power = [np.mean(np.abs(rx[k * BLOCK:(k + 1) * BLOCK]) ** 2) for k in range(n_blocks)]
+start = int(np.argmax(power)) * BLOCK
+start = min(start, max(len(rx) - SHOW, 0))
+seg = slice(start, start + SHOW)
 
-freqs = np.fft.fftshift(freqs) / 1e3
-psd = np.fft.fftshift(psd)
-spectrum_db = 10 * np.log10(psd + 1e-12)
+h = [1.0] * SPS
+len_y = len(rx) + len(h) - 1
+y = [0.0 + 0.0j] * len_y
 
-center_idx = len(freqs) // 2
-search_spectrum = spectrum_db.copy()
-search_spectrum[center_idx - 2 : center_idx + 3] = -9999
-peak_idx = np.argmax(search_spectrum)
-max_freq_khz = freqs[peak_idx]
-max_power_db = spectrum_db[peak_idx]
-noise_floor = np.median(spectrum_db)
+for n in range(len_y):
+    acc = 0.0 + 0.0j
+    for k in range(len(h)):
+        if 0 <= n - k < len(rx):
+            acc += rx[n - k] * h[k]
+    y[n] = acc
 
-print(f"Уровень шума (медиана): {noise_floor:.2f} дБ")
-print(f"Максимальный сигнал найден на частоте: {max_freq_khz:+.2f} кГц (Мощность: {max_power_db:.2f} дБ)")
+y = np.asarray(y)
 
-window_size = 1000
-power_envelope = rx_i[:num_samples // window_size * window_size].reshape(-1, window_size)**2 + \
-                 rx_q[:num_samples // window_size * window_size].reshape(-1, window_size)**2
-mean_power = np.mean(power_envelope, axis=1)
-
-threshold = np.median(mean_power) * 3
-active_blocks = np.where(mean_power > threshold)[0]
-
-if len(active_blocks) > 0:
-    signal_start_sample = active_blocks[0] * window_size
-    print(f"Сигнал обнаружен примерно на {signal_start_sample / sample_rate:.3f секунде записи}")
-else:
-    signal_start_sample = 0
-    print("Явного всплеска мощности не найдено, показываем начало файла.")
-
-plot_len = min(50000, num_samples - signal_start_sample)
-start_idx = signal_start_sample
-end_idx = start_idx + plot_len
-
-t_ms = (np.arange(plot_len) / sample_rate) * 1e3 + (start_idx / sample_rate * 1e3)
-
-fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
-
-ax1.plot(t_ms, rx_i[start_idx:end_idx], label="RX I (Cos)", color="blue", alpha=0.6)
-ax1.plot(t_ms, rx_q[start_idx:end_idx], label="RX Q (Sin)", color="red", alpha=0.6)
-ax1.set_title(f"Сигнал во времени (показан участок с отметки {start_idx/sample_rate:.2f} сек)")
-ax1.set_xlabel("Время от начала записи (миллисекунды)")
-ax1.set_ylabel("Амплитуда")
-ax1.grid(True)
-ax1.legend(loc="upper right")
-
-ax2.plot(freqs, spectrum_db, color="darkred", label="Спектр (Усредненный по всему файлу)")
-ax2.axvline(
-    x=max_freq_khz,
-    color="green",
-    linestyle="--",
-    linewidth=2,
-    label=f"Максимум амплитуды: {max_freq_khz:.1f} кГц",
-)
-ax2.set_title(
-    f"Анализ спектра: Максимальный сигнал обнаружен на частоте {max_freq_khz:.1f} кГц (Мощность: {max_power_db:.1f} дБ)",
-    color="darkgreen",
-    fontweight="bold",
-)
-ax2.set_xlabel("Частота / Отстройка (кГц)")
-ax2.set_ylabel("Плотность мощности (дБ)")
-ax2.grid(True)
-ax2.legend(loc="upper right")
-
+# --- ГРАФИК 1: Исходный входной I/Q ---
+plt.figure(figsize=(6, 6))
+plt.scatter(rx_i[seg], rx_q[seg], color="blue", alpha=0.6, label="I/Q")
+plt.title("I/Q Созвездие (до фильтра)")
+plt.xlabel("I")
+plt.ylabel("Q")
+plt.axhline(0, color="black", linewidth=0.8, linestyle="--")
+plt.axvline(0, color="black", linewidth=0.8, linestyle="--")
+plt.grid(True)
+plt.legend(loc="upper right")
 plt.tight_layout()
+
+# --- ГРАФИК 2: После согласованного фильтра (все отсчеты) ---
+plt.figure(figsize=(6, 6))
+plt.scatter(y[seg].real, y[seg].imag, color="blue", alpha=0.6, label="Filtered I/Q")
+plt.title("I/Q Созвездие (после свертки)")
+plt.xlabel("I")
+plt.ylabel("Q")
+plt.axhline(0, color="black", linewidth=0.8, linestyle="--")
+plt.axvline(0, color="black", linewidth=0.8, linestyle="--")
+plt.grid(True)
+plt.legend(loc="upper right")
+plt.tight_layout()
+
+# --- 10 ГРАФИКОВ
+y_eval = y[start : start + SHOW]
+
+fig, axes = plt.subplots(2, 5, figsize=(18, 7), sharex=True, sharey=True)
+axes = axes.flatten()
+
+for phase in range(SPS):
+    z_phase = y_eval[phase::SPS]
+    
+    ax = axes[phase]
+    ax.scatter(z_phase.real, z_phase.imag, color="crimson", alpha=0.6, s=15)
+    ax.set_title(f"Фаза: {phase}")
+    ax.set_xlabel("I")
+    ax.set_ylabel("Q")
+    ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
+    ax.axvline(0, color="black", linewidth=0.8, linestyle="--")
+    ax.grid(True)
+
+plt.suptitle("Созвездия )", fontsize=14)
+plt.tight_layout()
+
 plt.show()

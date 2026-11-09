@@ -1,45 +1,27 @@
-// Передача BPSK-сообщения между двумя Adalm Pluto по эфиру, в обе стороны.
-// База - пример преподавателя, изменения помечены "// ИЗМЕНЕНО" / "// ДОБАВЛЕНО".
-//
-// Формирование сигнала (один раз до основного цикла):
-//   текст -> биты (ASCII, старший бит первым) -> символы (0 -> -1, 1 -> +1)
-//   -> upsampling (после каждого символа SPS-1 нулей) -> свертка с h (прямоугольник из SPS единиц)
-//   -> пауза из нулей -> x AMPLITUDE -> I (Q = 0)
-// В цикле каждый буфер TX начинается с сообщения, остаток буфера - нули (пауза).
-// Так сообщение никогда не попадает на стык буферов, где стоит служебный заголовок с меткой времени.
-// Если сообщение длиннее буфера - оно раскладывается по буферам по кругу (тогда на стыках возможны ошибки).
-//
-// Аргумент задает частотный план платы:
-//   ./main tx usb:1.7.5 ["текст"]  ->  TX 800 МГц, RX 840 МГц
-//   ./main rx usb:1.9.5 ["текст"]  ->  TX 840 МГц, RX 800 МГц
-// Обе платы и передают, и принимают: плата "tx" слышит плату "rx" на 840,
-// плата "rx" слышит плату "tx" на 800. Текст - необязательный 3-й аргумент.
-//
-// Адрес платы - при запуске (lsusb: Bus 001 Device 007 -> usb:1.7.5, или iio_info -s).
-// Можно в двух терминалах на одном компьютере или по одному на разных компьютерах.
-// Файлы: <режим>_sent.pcm - отправленное, <режим>_recv.pcm - принятое.
-// Пишется ВСЁ с момента старта до Ctrl+C (~7.7 МБ/с на каждый файл), при новом запуске файлы перезаписываются.
-// Остановка - Ctrl+C.
+// Передача BPSK / QPSK сообщения между двумя Adalm Pluto по эфиру, в обе стороны.
+// База - пример преподавателя, доработанный под ДЗ (4 шага передатчика с комплексными числами).
+
 #include <SoapySDR/Device.h>
 #include <SoapySDR/Formats.h>
-#include <stdio.h> //printf
-#include <stdlib.h> //free
+#include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <complex.h>
-#include <string.h> // ДОБАВЛЕНО: strcmp, strlen
-#include <math.h>   // ДОБАВЛЕНО: carg
-#include <signal.h> // ДОБАВЛЕНО: Ctrl+C
+#include <string.h>
+#include <math.h>
+#include <signal.h>
 
-// ДОБАВЛЕНО: параметры
+// Параметры SDR
 #define SAMPLE_RATE  1e6
-#define AMPLITUDE    2000 // максимум 2047 (12 бит)
+#define AMPLITUDE    2000 // максимум 2047 (12 бит ЦАП)
 #define PRINT_EVERY  250  // печать статуса раз в 250 буферов (~0.5 с)
 
-// ДОБАВЛЕНО: параметры модуляции
-#define SPS          10   // отсчетов на символ (samples per symbol): 1 МГц / 10 = 100 тыс. символов/с
+// Параметры модуляции
+#define USE_QPSK     0    // 0 = BPSK, 1 = QPSK (переключатель для сдачи ДЗ)
+#define SPS          10   // отсчетов на символ (samples per symbol)
 #define GAP_SYMBOLS  32   // пауза из нулей между повторами сообщения (в символах)
 
-// ДОБАВЛЕНО: частотный план по схеме и сообщения по умолчанию
+// Частотный план и сообщения по умолчанию
 #define TX_MODE_TX_FREQ 800e6
 #define TX_MODE_RX_FREQ 840e6
 #define TX_MODE_MSG     "Hello from TX"
@@ -47,19 +29,27 @@
 #define RX_MODE_RX_FREQ 800e6
 #define RX_MODE_MSG     "Hello from RX"
 
-// ДОБАВЛЕНО: остановка по Ctrl+C
+// Остановка по Ctrl+C
 static volatile sig_atomic_t running = 1;
 static void on_sigint(int sig)
 {
     (void)sig;
     running = 0;
-    signal(SIGINT, SIG_DFL); // второй Ctrl+C - выход сразу
+    signal(SIGINT, SIG_DFL);
 }
 
-// ================= ДОБАВЛЕНО: формирование BPSK-сигнала =================
+// ================= ДОМАШНЕЕ ЗАДАНИЕ: 4 ШАГА ПЕРЕДАТЧИКА =================
 
-// Текст -> биты: каждый байт раскладывается в 8 бит, старший бит первым.
-// Возвращает количество бит.
+// --- ШАГ 1. Генератор битов ---
+
+// Вариант А: генерация случайных битов 
+static void generate_random_bits(int *bits, size_t n_bits)
+{
+    for (size_t i = 0; i < n_bits; i++)
+        bits[i] = rand() % 2; // 0 или 1
+}
+
+// Вариант Б: перевод текста в биты (ASCII, старший бит первым)
 static size_t message_to_bits(const char *msg, int *bits)
 {
     size_t len = strlen(msg);
@@ -69,31 +59,56 @@ static size_t message_to_bits(const char *msg, int *bits)
     return len * 8;
 }
 
-// Биты -> символы BPSK: 0 -> -1, 1 -> +1
-static void bits_to_symbols(const int *bits, size_t n_bits, double *symbols)
+// --- ШАГ 2. Модуляция (BPSK и QPSK) с комплексными значениями ---
+
+// BPSK: 1 бит -> 1 комплексный символ (меняется только Re/I, а Im/Q = 0)
+// 0 -> -1 + 0i, 1 -> +1 + 0i
+static size_t modulate_bpsk(const int *bits, size_t n_bits, double complex *symbols)
 {
     for (size_t i = 0; i < n_bits; i++)
-        symbols[i] = bits[i] ? +1.0 : -1.0;
+    {
+        double re = bits[i] ? +1.0 : -1.0;
+        symbols[i] = re + 0.0 * I;
+    }
+    return n_bits; // количество символов равно количеству бит
 }
 
-// Upsampling: после каждого символа вставляем sps-1 нулей.
-// Результат длиной n_symbols * sps.
-static void upsample(const double *symbols, size_t n_symbols, int sps, double *out)
+// QPSK: 2 бита -> 1 комплексный символ (первый бит в Re/I, второй бит в Im/Q)
+// 00 -> -1 - 1i, 01 -> -1 + 1i, 10 -> +1 - 1i, 11 -> +1 + 1i
+static size_t modulate_qpsk(const int *bits, size_t n_bits, double complex *symbols)
+{
+    size_t n_symbols = n_bits / 2;
+    for (size_t i = 0; i < n_symbols; i++)
+    {
+        double re = bits[2 * i]     ? +1.0 : -1.0;
+        double im = bits[2 * i + 1] ? +1.0 : -1.0;
+        symbols[i] = re + im * I;
+    }
+    return n_symbols; // символов в 2 раза меньше, чем бит
+}
+
+// --- ШАГ 3. Upsampling (добавление нулей между символами) ---
+
+// После каждого комплексного символа вставляем sps - 1 комплексных нулей
+static void upsample(const double complex *symbols, size_t n_symbols, int sps, double complex *out)
 {
     for (size_t i = 0; i < n_symbols * sps; i++)
-        out[i] = 0.0;
+        out[i] = 0.0 + 0.0 * I;
+
     for (size_t i = 0; i < n_symbols; i++)
         out[i * sps] = symbols[i];
 }
 
-// Свертка: y[n] = sum_k x[k] * h[n - k].
-// Результат длиной len_x + len_h - 1.
-static void convolve(const double *x, size_t len_x, const double *h, size_t len_h, double *y)
+// --- ШАГ 4. Свертка (получение прямоугольных импульсов) ---
+
+// Свертка комплексного сигнала x с импульсной характеристикой фильтра h:
+// y[n] = sum_k x[k] * h[n - k]
+static void convolve(const double complex *x, size_t len_x, const double *h, size_t len_h, double complex *y)
 {
     size_t len_y = len_x + len_h - 1;
     for (size_t n = 0; n < len_y; n++)
     {
-        double acc = 0.0;
+        double complex acc = 0.0 + 0.0 * I;
         for (size_t k = 0; k < len_x; k++)
         {
             if (n >= k && n - k < len_h)
@@ -103,63 +118,84 @@ static void convolve(const double *x, size_t len_x, const double *h, size_t len_
     }
 }
 
-// Полная цепочка: текст -> готовые отсчеты I (12 бит, без сдвига << 4).
-// Возвращает массив (malloc) и его длину в *out_len.
-static int16_t *build_bpsk_signal(const char *msg, size_t *out_len)
+// Полная сборка сигнала: возвращает массив int16_t, где лежат пары [I0, Q0, I1, Q1, ...]
+// В *out_samples записывается количество комплексных отсчетов (пар I/Q)
+static int16_t *build_tx_signal(const char *msg, size_t *out_samples)
 {
     size_t max_bits = strlen(msg) * 8;
-    int    *bits    = malloc(max_bits * sizeof(int));
-    double *symbols = malloc(max_bits * sizeof(double));
-    double *up      = malloc(max_bits * SPS * sizeof(double));
-    double *y       = malloc((max_bits * SPS + SPS - 1) * sizeof(double));
-    double  h[SPS];
+    int            *bits    = malloc(max_bits * sizeof(int));
+    double complex *symbols = malloc(max_bits * sizeof(double complex));
 
-    // Импульсная характеристика формирующего фильтра: прямоугольник из SPS единиц
+    // 1. Генерируем биты из текста
+    size_t n_bits = message_to_bits(msg, bits);
+    // Если нужно проверить просто случайные биты, можно раскомментировать:
+    // generate_random_bits(bits, n_bits);
+
+    // 2. Модуляция (выбираем BPSK или QPSK)
+    size_t n_symbols = 0;
+    if (USE_QPSK)
+        n_symbols = modulate_qpsk(bits, n_bits, symbols);
+    else
+        n_symbols = modulate_bpsk(bits, n_bits, symbols);
+
+    // Выделяем память под upsampling и свертку
+    size_t up_len = n_symbols * SPS;
+    size_t y_len  = up_len + SPS - 1;
+    double complex *up = malloc(up_len * sizeof(double complex));
+    double complex *y  = malloc(y_len * sizeof(double complex));
+
+    // 3. Upsampling (вставляем нули)
+    upsample(symbols, n_symbols, SPS, up);
+
+    // 4. Свертка с прямоугольным импульсом из SPS единиц
+    double h[SPS];
     for (int i = 0; i < SPS; i++)
         h[i] = 1.0;
 
-    size_t n_bits = message_to_bits(msg, bits);
-    bits_to_symbols(bits, n_bits, symbols);
-    upsample(symbols, n_bits, SPS, up);
-    size_t up_len = n_bits * SPS;
-    size_t y_len  = up_len + SPS - 1;
     convolve(up, up_len, h, SPS, y);
 
-    // Печатаем биты, чтобы потом сверить с принятым
-    printf("Сообщение: \"%s\" (%zu байт, %zu бит)\nБиты: ", msg, strlen(msg), n_bits);
+    // Вывод отладочной информации в консоль
+    printf("Модуляция: %s\n", USE_QPSK ? "QPSK" : "BPSK");
+    printf("Сообщение: \"%s\" (%zu байт, %zu бит, %zu символов)\nБиты: ",
+           msg, strlen(msg), n_bits, n_symbols);
     for (size_t i = 0; i < n_bits; i++)
         printf("%d%s", bits[i], (i % 8 == 7) ? " " : "");
     printf("\n");
 
-    // Итоговый сигнал: свертка + пауза из нулей между повторами
+    // Перевод комплексных отсчетов в формат ЦАП (чередование I, Q, I, Q...) + пауза в конце
     size_t gap = GAP_SYMBOLS * SPS;
-    size_t total = y_len + gap;
-    int16_t *signal_out = calloc(total, sizeof(int16_t));
+    size_t total_samples = y_len + gap;
+    int16_t *signal_out = calloc(2 * total_samples, sizeof(int16_t));
+
     for (size_t i = 0; i < y_len; i++)
-        signal_out[i] = (int16_t)(AMPLITUDE * y[i]); // y = +-1, на хвосте свертки - меньше
-    printf("Длина сигнала: %zu отсчетов (%.2f мс), из них пауза %zu\n",
-           total, total / SAMPLE_RATE * 1e3, gap);
+    {
+        signal_out[2 * i]     = (int16_t)(AMPLITUDE * creal(y[i])); // Канал I (Re)
+        signal_out[2 * i + 1] = (int16_t)(AMPLITUDE * cimag(y[i])); // Канал Q (Im)
+    }
+
+    printf("Длина сигнала: %zu комплексных отсчетов (%.2f мс), из них пауза %zu\n",
+           total_samples, total_samples / SAMPLE_RATE * 1e3, gap);
 
     free(bits);
     free(symbols);
     free(up);
     free(y);
-    *out_len = total;
+
+    *out_samples = total_samples;
     return signal_out;
 }
 
 // =======================================================================
 
-int main(int argc, char *argv[]) // ИЗМЕНЕНО: принимаем аргументы
+int main(int argc, char *argv[])
 {
-    // ДОБАВЛЕНО: частотный план (tx/rx), адрес платы и текст - из командной строки
     if (argc < 3 || (strcmp(argv[1], "tx") != 0 && strcmp(argv[1], "rx") != 0))
     {
         printf("Запуск:\n  %s tx <uri> [текст]   - TX 800 / RX 840 МГц\n  %s rx <uri> [текст]   - TX 840 / RX 800 МГц\n", argv[0], argv[0]);
         printf("Пример: %s tx usb:1.7.5 \"Hello\"\n", argv[0]);
-        printf("Адрес: usb:<Bus>.<Device>.5 из lsusb, или из iio_info -s\n");
         return EXIT_FAILURE;
     }
+
     int is_tx = (strcmp(argv[1], "tx") == 0);
     const char *mode = argv[1];
     const char *uri = argv[2];
@@ -169,24 +205,24 @@ int main(int argc, char *argv[]) // ИЗМЕНЕНО: принимаем арг�
         printf("Пустое сообщение\n");
         return EXIT_FAILURE;
     }
+
     double tx_freq = is_tx ? TX_MODE_TX_FREQ : RX_MODE_TX_FREQ;
     double rx_freq = is_tx ? TX_MODE_RX_FREQ : RX_MODE_RX_FREQ;
     printf("Режим: %s, устройство: %s\n", mode, uri);
-    printf("TX %.0f МГц, RX %.0f МГц, BPSK, %d отсчетов на символ (%.0f тыс. символов/с)\n",
-           tx_freq / 1e6, rx_freq / 1e6, SPS, SAMPLE_RATE / SPS / 1e3);
+    printf("TX %.0f МГц, RX %.0f МГц, %s, %d отсчетов на символ\n",
+           tx_freq / 1e6, rx_freq / 1e6, USE_QPSK ? "QPSK" : "BPSK", SPS);
     signal(SIGINT, on_sigint);
 
-    // ДОБАВЛЕНО: готовим сигнал заранее
-    size_t sig_len = 0;
-    int16_t *tx_signal = build_bpsk_signal(msg, &sig_len);
-    size_t sig_pos = 0; // текущая позиция в сигнале (для длинного сообщения - идем по кругу)
-    size_t msg_len = sig_len - GAP_SYMBOLS * SPS; // сообщение без паузы
+    // Готовим комплексный сигнал (пары I и Q) заранее
+    size_t sig_len = 0; // длина в комплексных отсчетах
+    int16_t *tx_signal = build_tx_signal(msg, &sig_len);
+    size_t sig_pos = 0;
+    size_t msg_len = sig_len - GAP_SYMBOLS * SPS;
 
     // Создание сущности устройства
-    // args can be user defined or from the enumeration result
     SoapySDRKwargs args = {};
     SoapySDRKwargs_set(&args, "driver", "plutosdr");
-    SoapySDRKwargs_set(&args, "uri", uri); // ИЗМЕНЕНО: адрес из командной строки
+    SoapySDRKwargs_set(&args, "uri", uri);
     SoapySDRKwargs_set(&args, "direct", "1");
     SoapySDRKwargs_set(&args, "timestamp_every", "1920");
     SoapySDRKwargs_set(&args, "loopback", "0");
@@ -200,29 +236,24 @@ int main(int argc, char *argv[]) // ИЗМЕНЕНО: принимаем арг�
         return EXIT_FAILURE;
     }
 
-    // Настраиваем устройства RX\TX
-    if (SoapySDRDevice_setSampleRate(sdr, SOAPY_SDR_RX, 0, 1e6) != 0)
-    {
+    // Настраиваем устройства RX/TX
+    if (SoapySDRDevice_setSampleRate(sdr, SOAPY_SDR_RX, 0, SAMPLE_RATE) != 0)
         printf("setSampleRate rx fail: %s\n", SoapySDRDevice_lastError());
-    }
-    if (SoapySDRDevice_setFrequency(sdr, SOAPY_SDR_RX, 0, rx_freq, NULL) != 0) // ИЗМЕНЕНО: частота по плану
-    {
+
+    if (SoapySDRDevice_setFrequency(sdr, SOAPY_SDR_RX, 0, rx_freq, NULL) != 0)
         printf("setFrequency rx fail: %s\n", SoapySDRDevice_lastError());
-    }
-    if (SoapySDRDevice_setSampleRate(sdr, SOAPY_SDR_TX, 0, 1e6) != 0)
-    {
+
+    if (SoapySDRDevice_setSampleRate(sdr, SOAPY_SDR_TX, 0, SAMPLE_RATE) != 0)
         printf("setSampleRate tx fail: %s\n", SoapySDRDevice_lastError());
-    }
-    if (SoapySDRDevice_setFrequency(sdr, SOAPY_SDR_TX, 0, tx_freq, NULL) != 0) // ИЗМЕНЕНО: частота по плану
-    {
+
+    if (SoapySDRDevice_setFrequency(sdr, SOAPY_SDR_TX, 0, tx_freq, NULL) != 0)
         printf("setFrequency tx fail: %s\n", SoapySDRDevice_lastError());
-    }
+
     printf("SoapySDRDevice_getFrequency tx: %lf\n", SoapySDRDevice_getFrequency(sdr, SOAPY_SDR_TX, 0));
-    printf("SoapySDRDevice_getFrequency rx: %lf\n", SoapySDRDevice_getFrequency(sdr, SOAPY_SDR_RX, 0)); // ДОБАВЛЕНО
+    printf("SoapySDRDevice_getFrequency rx: %lf\n", SoapySDRDevice_getFrequency(sdr, SOAPY_SDR_RX, 0));
 
     // Настройка каналов и стримов
-    size_t channels[] = {0}; // ИЗМЕНЕНО: было {0, 1}, у Pluto один канал (см. TODO в оригинале)
-
+    size_t channels[] = {0};
     size_t channel_count = sizeof(channels) / sizeof(channels[0]);
     SoapySDRStream *rxStream = SoapySDRDevice_setupStream(sdr, SOAPY_SDR_RX, SOAPY_SDR_CS16, channels, channel_count, NULL);
     if (rxStream == NULL)
@@ -232,13 +263,13 @@ int main(int argc, char *argv[]) // ИЗМЕНЕНО: принимаем арг�
         free(tx_signal);
         return EXIT_FAILURE;
     }
-    // ИЗМЕНЕНО: setGain принимает номер канала, а не массив
-    if(SoapySDRDevice_setGain(sdr, SOAPY_SDR_RX, channels[0], 30.0) !=0 ){
+
+    if (SoapySDRDevice_setGain(sdr, SOAPY_SDR_RX, channels[0], 30.0) != 0)
         printf("setGain rx fail: %s\n", SoapySDRDevice_lastError());
-    }
-    if(SoapySDRDevice_setGain(sdr, SOAPY_SDR_TX, channels[0], -40.0) !=0 ){
+
+    if (SoapySDRDevice_setGain(sdr, SOAPY_SDR_TX, channels[0], -40.0) != 0)
         printf("setGain tx fail: %s\n", SoapySDRDevice_lastError());
-    }
+
     SoapySDRStream *txStream = SoapySDRDevice_setupStream(sdr, SOAPY_SDR_TX, SOAPY_SDR_CS16, channels, channel_count, NULL);
     if (txStream == NULL)
     {
@@ -248,92 +279,71 @@ int main(int argc, char *argv[]) // ИЗМЕНЕНО: принимаем арг�
         return EXIT_FAILURE;
     }
 
-    // Получение MTU (Maximum Transmission Unit), в нашем случае - размер буферов.
     size_t rx_mtu = SoapySDRDevice_getStreamMTU(sdr, rxStream);
     size_t tx_mtu = SoapySDRDevice_getStreamMTU(sdr, txStream);
     printf("MTU - TX: %lu, RX: %lu\n", tx_mtu, rx_mtu);
 
-    // ДОБАВЛЕНО: помещается ли сообщение с паузой в один буфер (полезных отсчетов в буфере tx_mtu - 6)
     size_t payload = tx_mtu - 6;
     int one_per_buffer = (msg_len + GAP_SYMBOLS * SPS <= payload);
     if (one_per_buffer)
         printf("Сообщение (%zu отсчетов) передается в начале каждого буфера, остаток буфера - пауза\n", msg_len);
     else
-        printf("ВНИМАНИЕ: сообщение длиннее буфера (%zu > %zu отсчетов) - идет по кругу через стыки буферов,\n"
-               "на стыках возможны ошибки. Для надежной передачи - не больше %zu символов текста.\n",
-               msg_len + GAP_SYMBOLS * SPS, payload, (payload - GAP_SYMBOLS * SPS) / SPS / 8);
+        printf("ВНИМАНИЕ: сообщение длиннее буфера (%zu > %zu отсчетов) - идет по кругу через стыки буферов\n",
+               msg_len + GAP_SYMBOLS * SPS, payload);
 
+    int16_t tx_buff[2 * tx_mtu];
+    int16_t rx_buffer[2 * rx_mtu];
+    int16_t sent_buff[2 * tx_mtu];
 
-    int16_t tx_buff[2*tx_mtu];
-    int16_t rx_buffer[2*rx_mtu];
-    int16_t sent_buff[2*tx_mtu]; // ДОБАВЛЕНО: отправленные сэмплы для записи в файл (12 бит, без заголовка)
-
-    //заполнение tx_buff значениями сэмплов первые 16 бит - I, вторые 16 бит - Q.
-    // ИЗМЕНЕНО: вместо константы 2000 - BPSK-сигнал, заполняется в основном цикле
-
-    //prepare fixed bytes in transmit buffer
-    //we transmit a pattern of FFFF FFFF [TS_0]00 [TS_1]00 [TS_2]00 [TS_3]00 [TS_4]00 [TS_5]00 [TS_6]00 [TS_7]00 FFFF FFFF
-    //that is a flag (FFFF FFFF) followed by the 64 bit timestamp, split into 8 bytes and packed into the lsb of each of the DAC words.
-    //DAC samples are left aligned 12-bits, so each byte is left shifted into place
-    for(size_t i = 0; i < 2; i++)
+    // Заполняем фиксированные флаги заголовка для метки времени
+    for (size_t i = 0; i < 2; i++)
     {
         tx_buff[0 + i] = 0xffff;
-        // 8 x timestamp words
         tx_buff[10 + i] = 0xffff;
     }
 
-    //activate streams
-    SoapySDRDevice_activateStream(sdr, rxStream, 0, 0, 0); //start streaming
-    SoapySDRDevice_activateStream(sdr, txStream, 0, 0, 0); //start streaming
+    // Активация потоков
+    SoapySDRDevice_activateStream(sdr, rxStream, 0, 0, 0);
+    SoapySDRDevice_activateStream(sdr, txStream, 0, 0, 0);
 
-    //here goes
     printf("Start test...\n");
-    const long  timeoutUs = 400000; // arbitrarily chosen (взяли из srsRAN)
+    const long timeoutUs = 400000;
 
-    // При первом запуске отчищаем rx_buff от возможного мусора.
-    for (size_t buffers_read = 0; buffers_read < 128 && running; /* in loop */)
+    // Очистка приемного буфера при старте
+    for (size_t buffers_read = 0; buffers_read < 128 && running;)
     {
-        void *buffs[] = {rx_buffer}; //array of buffers
-        int flags; //flags set by receive operation
-        long long timeNs; //timestamp for receive buffer
-        // Read samples
+        void *buffs[] = {rx_buffer};
+        int flags;
+        long long timeNs;
         int sr = SoapySDRDevice_readStream(sdr, rxStream, buffs, rx_mtu, &flags, &timeNs, timeoutUs);
         if (sr < 0)
-        {
-            // Skip read on error (likely timeout)
             continue;
-        }
-        // Increment number of buffers read
         buffers_read++;
     }
 
     long long last_time = 0;
 
-    // ИЗМЕНЕНО: два файла, имена с режимом, чтобы два процесса в одной папке не затирали друг друга
     char sent_name[64], recv_name[64];
     snprintf(sent_name, sizeof(sent_name), "%s_sent.pcm", mode);
     snprintf(recv_name, sizeof(recv_name), "%s_recv.pcm", mode);
     FILE *sent_file = fopen(sent_name, "wb");
     FILE *recv_file = fopen(recv_name, "wb");
 
-    int peak = 0;           // ДОБАВЛЕНО: пик амплитуды приема
-    double complex rot = 0; // ДОБАВЛЕНО: накопитель для оценки сдвига частоты между платами
+    int peak = 0;
+    double complex rot = 0;
 
-    // ИЗМЕНЕНО: бесконечный цикл до Ctrl+C (было 10 итераций)
+    // Основной цикл приема и передачи
     for (size_t buffers_read = 0; running; buffers_read++)
     {
         void *rx_buffs[] = {rx_buffer};
-        int flags;        // flags set by receive operation
-        long long timeNs; //timestamp for receive buffer
+        int flags;
+        long long timeNs;
 
         int sr = SoapySDRDevice_readStream(sdr, rxStream, rx_buffs, rx_mtu, &flags, &timeNs, timeoutUs);
         if (sr < 0)
-        {
-            // Skip read on error (likely timeout)
             continue;
-        }
 
-        // ===== ДОБАВЛЕНО: прием - то, что пришло от ДРУГОЙ платы =====
+        // Запись принятого сигнала в файл
         if (recv_file != NULL)
             fwrite(rx_buffer, 2 * sizeof(int16_t), sr, recv_file);
 
@@ -341,8 +351,6 @@ int main(int argc, char *argv[]) // ИЗМЕНЕНО: принимаем арг�
             if (abs(rx_buffer[i]) > peak)
                 peak = abs(rx_buffer[i]);
 
-        // Оценка сдвига частоты между платами по повороту фазы между соседними сэмплами
-        // (внутри символа BPSK-сигнал постоянен, поэтому поворот = расхождение генераторов)
         for (int i = 1; i < sr; i++)
         {
             double complex cur  = rx_buffer[2 * i]       + I * rx_buffer[2 * i + 1];
@@ -353,7 +361,7 @@ int main(int argc, char *argv[]) // ИЗМЕНЕНО: принимаем арг�
         if (buffers_read % PRINT_EVERY == 0)
         {
             double f_khz = carg(rot) * SAMPLE_RATE / (2.0 * M_PI) / 1e3;
-            printf("Buffer: %lu - TimeDiff: %lli | прием: пик %4d из 2047, сдвиг частоты ~%+.2f кГц%s\n",
+            printf("Buffer: %lu | TimeDiff: %lli | прием: пик %4d из 2047, сдвиг частоты ~%+.2f кГц%s\n",
                    buffers_read, timeNs - last_time, peak, f_khz,
                    peak < 20 ? "  - только шум, другая плата не передает?" : "");
             peak = 0;
@@ -361,36 +369,41 @@ int main(int argc, char *argv[]) // ИЗМЕНЕНО: принимаем арг�
         }
         last_time = timeNs;
 
-        // ===== передача =====
-        // Переменная для времени отправки сэмплов относительно текущего приема
-        long long tx_time = timeNs + (4 * 1000 * 1000); // на 4 [мс] в будущее
+        // ===== ПЕРЕДАЧА =====
+        long long tx_time = timeNs + (4 * 1000 * 1000); // +4 мс в будущее
 
-        // Добавляем время, когда нужно передать блок tx_buff, через N -наносекунд
-        for(size_t i = 0; i < 8; i++)
+        for (size_t i = 0; i < 8; i++)
         {
-            // Extract byte from tx time
             uint8_t tx_time_byte = (tx_time >> (i * 8)) & 0xff;
-
-            // Add byte to buffer
             tx_buff[2 + i] = tx_time_byte << 4;
         }
 
-        // ИЗМЕНЕНО: вместо синуса - BPSK-сигнал. Первые 12 слов - заголовок, их не трогаем.
+        // Заполняем буфер парами I и Q (первые 12 элементов - служебный заголовок)
         for (size_t i = 12, j = 0; i < 2 * tx_mtu; i += 2, j++)
         {
-            int16_t v;
+            int16_t v_i = 0;
+            int16_t v_q = 0;
+
             if (one_per_buffer)
-                v = (j < msg_len) ? tx_signal[j] : 0;  // сообщение с начала буфера, дальше пауза
+            {
+                if (j < msg_len)
+                {
+                    v_i = tx_signal[2 * j];
+                    v_q = tx_signal[2 * j + 1];
+                }
+            }
             else
             {
-                v = tx_signal[sig_pos];                // длинное сообщение - по кругу
+                v_i = tx_signal[2 * sig_pos];
+                v_q = tx_signal[2 * sig_pos + 1];
                 sig_pos = (sig_pos + 1) % sig_len;
             }
-            tx_buff[i]     = (int16_t)(v * 16); // I, сдвиг на 4 бита (12 бит ЦАП)
-            tx_buff[i + 1] = 0;                 // Q = 0: BPSK одномерная
+
+            tx_buff[i]     = (int16_t)(v_i * 16); // I, сдвиг на 4 бита (под 12-битный ЦАП)
+            tx_buff[i + 1] = (int16_t)(v_q * 16); // Q, сдвиг на 4 бита (в BPSK тут будет 0, в QPSK +-2000)
         }
 
-        // ДОБАВЛЕНО: сохраняем отправленное (без заголовка, 12 бит) - каждый буфер, одной записью
+        // Сохраняем отправленные сэмплы (без заголовка) в файл для проверки
         if (sent_file != NULL)
         {
             size_t cnt = 0;
@@ -399,8 +412,6 @@ int main(int argc, char *argv[]) // ИЗМЕНЕНО: принимаем арг�
             fwrite(sent_buff, sizeof(int16_t), cnt, sent_file);
         }
 
-        // Send buffer
-        // ИЗМЕНЕНО: отправляем каждый буфер, а не только при buffers_read == 2
         void *tx_buffs[] = {tx_buff};
         flags = SOAPY_SDR_HAS_TIME;
         int st = SoapySDRDevice_writeStream(sdr, txStream, (const void * const*)tx_buffs, tx_mtu, &flags, tx_time, timeoutUs);
@@ -409,25 +420,19 @@ int main(int argc, char *argv[]) // ИЗМЕНЕНО: принимаем арг�
             printf("TX Failed: %i\n", st);
         }
     }
+
     if (sent_file != NULL) fclose(sent_file);
     if (recv_file != NULL) fclose(recv_file);
 
     printf("\nОстановка... Записаны %s и %s\n", sent_name, recv_name);
 
-    //stop streaming
     SoapySDRDevice_deactivateStream(sdr, rxStream, 0, 0);
     SoapySDRDevice_deactivateStream(sdr, txStream, 0, 0);
-
-    //shutdown the stream
     SoapySDRDevice_closeStream(sdr, rxStream);
     SoapySDRDevice_closeStream(sdr, txStream);
-
-    //cleanup device handle
     SoapySDRDevice_unmake(sdr);
 
-    free(tx_signal); // ДОБАВЛЕНО
-
-    //all done
+    free(tx_signal);
     printf("test complete!\n");
 
     return EXIT_SUCCESS;
