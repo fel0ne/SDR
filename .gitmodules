@@ -1,0 +1,21 @@
+[submodule "third_party/glfw"]
+	path = third_party/glfw
+	url = https://github.com/glfw/glfw.git
+[submodule "third_party/libiio"]
+	path = third_party/libiio
+	url = https://github.com/TelecomDep/libiio.git
+[submodule "third_party/SoapySDR"]
+	path = third_party/SoapySDR
+	url = https://github.com/TelecomDep/SoapySDR.git
+[submodule "third_party/libad9361-iio"]
+	path = third_party/libad9361-iio
+	url = https://github.com/TelecomDep/libad9361-iio.git
+[submodule "third_party/SoapyPlutoSDR"]
+	path = third_party/SoapyPlutoSDR
+	url = https://github.com/TelecomDep/SoapyPlutoSDR.git
+[submodule "third_party/imgui"]
+	path = third_party/imgui
+	url = https://github.com/ocornut/imgui.git
+[submodule "third_party/implot"]
+	path = third_party/implot
+	url = https://github.com/epezent/implot.git

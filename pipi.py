@@ -8,8 +8,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy import signal
 
-SENT_FILE = sys.argv[1] if len(sys.argv) > 1 else "recorded_data/BPSK/tx_sent.pcm"
-RECV_FILE = sys.argv[2] if len(sys.argv) > 2 else "recorded_data/BPSK/rx_recv.pcm"
+SENT_FILE = sys.argv[1] if len(sys.argv) > 1 else "recorded_data/QPSK/tx_sent.pcm"
+RECV_FILE = sys.argv[2] if len(sys.argv) > 2 else "recorded_data/QPSK/rx_recv.pcm"
 SAMPLE_RATE = 1e6
 SHOW = 50000   # сколько отсчетов показать во времени (1.5 мс)
 BLOCK = 1920  # размер буфера в C-коде
@@ -25,6 +25,12 @@ def read_iq(name):
     raw = raw[: len(raw) // 2 * 2].astype(np.float32)
     return raw[0::2], raw[1::2]
 
+def gardner_ted(x, y, k, Ts, tau_hat):
+    prev = int((k - 1) * Ts + tau_hat)
+    mid  = int((k - 0.5) * Ts + tau_hat)
+    curr = int(k * Ts + tau_hat)
+
+    return x[mid] * (x[prev] - x[curr]) + y[mid] * (y[prev] - y[curr])
 
 tx_i, tx_q = read_iq(SENT_FILE)
 rx_i, rx_q = read_iq(RECV_FILE)
@@ -94,7 +100,41 @@ for phase in range(SPS):
     ax.axvline(0, color="black", linewidth=0.8, linestyle="--")
     ax.grid(True)
 
+
 plt.suptitle("Созвездия )", fontsize=14)
+plt.tight_layout()
+
+
+
+
+e_mean = [0.0] * SPS
+x = y_eval.real
+y_iq = y_eval.imag
+
+# Сколько символов берем для усреднения (например, 2000)
+num_symbols = 2000
+
+e = []
+
+# Перебираем 10 фаз стробирования (tau_hat от 0 до 9)
+for phase in range(SPS):
+    errors = []
+    for k in range(1, num_symbols):
+        err = gardner_ted(x, y_iq, k,SPS, phase)
+        errors.append(err)
+    
+    # Средняя ошибка для текущей фазы
+    e.append(np.mean(errors))
+
+# --- График S-кривой ---
+plt.figure(figsize=(7, 5))
+plt.plot(range(SPS), e, marker="o", color="blue")
+plt.title("Ошибка Гарднера от фазы стробирования")
+plt.xlabel("Фаза (сдвиг отсчета)")
+plt.ylabel("Средняя ошибка e")
+plt.xticks(range(SPS))
+plt.axhline(0, color="black", linestyle="--")
+plt.grid(True)
 plt.tight_layout()
 
 plt.show()
