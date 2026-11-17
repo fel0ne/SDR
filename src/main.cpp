@@ -1,5 +1,5 @@
 // Передача BPSK / QPSK сообщения между двумя Adalm Pluto по эфиру, в обе стороны.
-// Многопоточная версия с графическим интерфейсом (ImGui + ImPlot) и управлением в реальном времени.
+// Многопоточная версия с графическим интерфейсом (ImGui + ImPlot) и символьной синхронизацией Гарднера.
 
 #include <SoapySDR/Device.h>
 #include <SoapySDR/Formats.h>
@@ -41,8 +41,8 @@ using Complex = std::complex<double>;
 
 struct SharedState {
     std::atomic<bool> app_running{true};
-    std::atomic<bool> want_connected{false}; // команда от GUI: подключиться / отключиться
-    std::atomic<bool> sdr_connected{false};  // фактический статус подключения
+    std::atomic<bool> want_connected{false};
+    std::atomic<bool> sdr_connected{false};
 
     std::atomic<bool> tx_enabled{true};
     std::atomic<bool> record_pcm{false};
@@ -66,12 +66,13 @@ struct SharedState {
     std::atomic<float> rx_freq_mhz{840.0f}; // МГц
     std::atomic<float> tx_freq_mhz{800.0f}; // МГц
 
-    // Параметры отображения созвездия
+    // Параметры символьной синхронизации и созвездия
     std::atomic<int>   constellation_pts{1000};
-    std::atomic<int>   strobe_phase{5};      // 0 .. sps-1
+    std::atomic<bool>  auto_symbol_sync{true}; // Автовыбор фазы по Гарднеру
+    std::atomic<int>   strobe_phase{5};        // 0 .. sps-1
     std::atomic<bool>  decimate_by_sps{true};
-    std::atomic<float> phase_rot_deg{0.0f};  // ручной доворот фазы (-180..180)
-    std::atomic<float> plot_scale{2200.0f};  // предел осей I/Q
+    std::atomic<float> phase_rot_deg{0.0f};    // Ручной доворот фазы (-180..180)
+    std::atomic<float> plot_scale{2200.0f};    // Предел осей I/Q
 
     // Телеметрия от SDR -> GUI
     std::atomic<int>    rx_peak{0};
@@ -80,12 +81,14 @@ struct SharedState {
     std::mutex status_mutex;
     std::string status_text = "Отключено. Введите URI PlutoSDR и нажмите «Подключиться»";
 
-    // Буфер точек для созвездия и осциллограммы
+    // Буферы для графиков
     std::mutex iq_mutex;
     std::vector<double> iq_i;
     std::vector<double> iq_q;
     std::vector<double> wave_i;
     std::vector<double> wave_q;
+    std::vector<double> gardner_phases;
+    std::vector<double> gardner_errors;
 };
 
 static SharedState g_state;
@@ -105,6 +108,8 @@ static void clear_iq_buffers()
     g_state.iq_q.clear();
     g_state.wave_i.clear();
     g_state.wave_q.clear();
+    g_state.gardner_phases.clear();
+    g_state.gardner_errors.clear();
     g_state.rx_peak = 0;
     g_state.cfo_khz = 0.0;
 }
@@ -215,25 +220,118 @@ static std::vector<int16_t> build_tx_signal(const std::string &msg, int use_qpsk
     return signal_out;
 }
 
-static void push_rx_samples_to_gui(const int16_t *rx_buffer, size_t num_samples, int sps, int strobe_phase, bool decimate)
+// ================= БЛОК СИМВОЛЬНОЙ СИНХРОНИЗАЦИИ (GARDNER TED) =================
+
+// Детектор временной ошибки Гарднера (как в pipi.py)
+static inline double gardner_ted(const std::vector<double> &x, const std::vector<double> &y, int k, int Ts, int tau_hat)
 {
+    int prev = (int)((k - 1) * Ts + tau_hat);
+    int mid  = (int)((k - 0.5) * Ts + tau_hat);
+    int curr = (int)(k * Ts + tau_hat);
+
+    return x[mid] * (x[prev] - x[curr]) + y[mid] * (y[prev] - y[curr]);
+}
+
+// Согласованный фильтр (свёртка с прямоугольным импульсом длины sps) + поиск фазы строба по S-кривой Гарднера
+static void process_symbol_sync(const int16_t *rx_buffer, size_t num_samples, int sps)
+{
+    if (num_samples == 0 || sps < 2)
+        return;
+
+    // 1. Входной комплексный буфер
+    std::vector<Complex> rx(num_samples);
+    for (size_t i = 0; i < num_samples; i++)
+        rx[i] = Complex((double)rx_buffer[2 * i], (double)rx_buffer[2 * i + 1]);
+
+    // 2. Согласованный фильтр: h = [1/sps, ..., 1/sps] (скользящее среднее длины sps)
+    std::vector<double> filt_i(num_samples, 0.0);
+    std::vector<double> filt_q(num_samples, 0.0);
+    Complex acc(0.0, 0.0);
+    for (size_t n = 0; n < num_samples; n++)
+    {
+        acc += rx[n];
+        if (n >= (size_t)sps)
+            acc -= rx[n - sps];
+        filt_i[n] = acc.real() / (double)sps;
+        filt_q[n] = acc.imag() / (double)sps;
+    }
+
+    // 3. Расчёт S-кривой ошибки Гарднера по всем фазам tau_hat = 0 .. sps-1
+    std::vector<double> phases(sps);
+    std::vector<double> s_curve(sps, 0.0);
+    int num_symbols = (int)(num_samples / sps) - 1;
+
+    if (num_symbols > 2)
+    {
+        for (int phase = 0; phase < sps; phase++)
+        {
+            phases[phase] = (double)phase;
+            double sum_err = 0.0;
+            int count = 0;
+            for (int k = 1; k < num_symbols; k++)
+            {
+                int curr_idx = k * sps + phase;
+                if (curr_idx < (int)num_samples)
+                {
+                    sum_err += gardner_ted(filt_i, filt_q, k, sps, phase);
+                    count++;
+                }
+            }
+            s_curve[phase] = (count > 0) ? (sum_err / count) : 0.0;
+        }
+    }
+
+    // 4. Поиск оптимальной фазы стробирования (переход S-кривой через ноль с отрицательным наклоном или минимум |e|)
+    int best_phase = g_state.strobe_phase.load() % sps;
+    if (g_state.auto_symbol_sync.load() && num_symbols > 2)
+    {
+        int zero_cross_phase = -1;
+        for (int p = 0; p < sps; p++)
+        {
+            int p_next = (p + 1) % sps;
+            if (s_curve[p] >= 0.0 && s_curve[p_next] <= 0.0)
+            {
+                zero_cross_phase = (fabs(s_curve[p]) < fabs(s_curve[p_next])) ? p : p_next;
+                break;
+            }
+        }
+
+        if (zero_cross_phase >= 0)
+        {
+            best_phase = zero_cross_phase;
+        }
+        else
+        {
+            double min_abs = fabs(s_curve[0]);
+            best_phase = 0;
+            for (int p = 1; p < sps; p++)
+            {
+                if (fabs(s_curve[p]) < min_abs)
+                {
+                    min_abs = fabs(s_curve[p]);
+                    best_phase = p;
+                }
+            }
+        }
+        g_state.strobe_phase = best_phase;
+    }
+
+    // 5. Прореживание отфильтрованного сигнала с найденной фазой и доворот фазы созвездия
     int max_pts = g_state.constellation_pts.load();
+    bool decimate = g_state.decimate_by_sps.load();
     float rot_rad = g_state.phase_rot_deg.load() * (float)M_PI / 180.0f;
     double cos_r = cos(rot_rad);
     double sin_r = sin(rot_rad);
 
-    int step = (decimate && sps > 1) ? sps : 1;
-    int offset = (decimate && sps > 1) ? (strobe_phase % sps) : 0;
+    int step   = (decimate && sps > 1) ? sps : 1;
+    int offset = (decimate && sps > 1) ? (best_phase % sps) : 0;
 
     std::lock_guard<std::mutex> lock(g_state.iq_mutex);
 
     for (size_t i = offset; i < num_samples; i += step)
     {
-        double raw_i = (double)rx_buffer[2 * i];
-        double raw_q = (double)rx_buffer[2 * i + 1];
-
-        double rot_i = raw_i * cos_r - raw_q * sin_r;
-        double rot_q = raw_i * sin_r + raw_q * cos_r;
+        double rot_i = filt_i[i] * cos_r - filt_q[i] * sin_r;
+        double rot_q = filt_i[i] * sin_r + filt_q[i] * cos_r;
 
         g_state.iq_i.push_back(rot_i);
         g_state.iq_q.push_back(rot_q);
@@ -246,14 +344,13 @@ static void push_rx_samples_to_gui(const int16_t *rx_buffer, size_t num_samples,
         g_state.iq_q.erase(g_state.iq_q.begin(), g_state.iq_q.begin() + excess);
     }
 
+    // Сохраняем S-кривую и осциллограмму после согласованного фильтра
+    g_state.gardner_phases = phases;
+    g_state.gardner_errors = s_curve;
+
     size_t wave_len = std::min<size_t>(num_samples, 250);
-    g_state.wave_i.resize(wave_len);
-    g_state.wave_q.resize(wave_len);
-    for (size_t i = 0; i < wave_len; i++)
-    {
-        g_state.wave_i[i] = (double)rx_buffer[2 * i];
-        g_state.wave_q[i] = (double)rx_buffer[2 * i + 1];
-    }
+    g_state.wave_i.assign(filt_i.begin(), filt_i.begin() + wave_len);
+    g_state.wave_q.assign(filt_q.begin(), filt_q.begin() + wave_len);
 }
 
 // ================= ФОНОВЫЙ ПОТОК SDR =================
@@ -262,7 +359,6 @@ static void sdr_worker()
 {
     while (g_state.app_running)
     {
-        // Ждём нажатия кнопки «Подключиться»
         if (!g_state.want_connected)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -442,7 +538,7 @@ static void sdr_worker()
                 was_recording = false;
             }
 
-            // 4. ПРИЁМ
+            // 4. ПРИЁМ И СИМВОЛЬНАЯ СИНХРОНИЗАЦИЯ
             void *rx_buffs[] = {rx_buffer.data()};
             int flags;
             long long timeNs;
@@ -466,7 +562,7 @@ static void sdr_worker()
 
             if (buffers_read % 2 == 0)
             {
-                push_rx_samples_to_gui(rx_buffer.data(), sr, cur_sps, g_state.strobe_phase.load(), g_state.decimate_by_sps.load());
+                process_symbol_sync(rx_buffer.data(), sr, cur_sps);
             }
 
             if (buffers_read % 50 == 0)
@@ -661,6 +757,7 @@ int main(int argc, char *argv[])
 
     std::vector<double> local_i, local_q;
     std::vector<double> local_wi, local_wq;
+    std::vector<double> local_g_phases, local_g_errors;
 
     while (!glfwWindowShouldClose(window) && g_state.app_running)
     {
@@ -705,7 +802,7 @@ int main(int argc, char *argv[])
         float left_width = 390.0f;
         ImGui::BeginChild("ControlsPanel", ImVec2(left_width, 0), true);
 
-        // 1. ПОДКЛЮЧЕНИЕ И СООБЩЕНИЕ (самое главное сверху)
+        // 1. ПОДКЛЮЧЕНИЕ И СООБЩЕНИЕ
         ImGui::TextColored(ImVec4(0.0f, 0.82f, 0.95f, 1.0f), "ПОДКЛЮЧЕНИЕ PLUTOSDR И СООБЩЕНИЕ");
         ImGui::Spacing();
 
@@ -722,7 +819,6 @@ int main(int argc, char *argv[])
         }
         if (is_connected) ImGui::EndDisabled();
 
-        // Быстрые пресеты ролей (TX / RX)
         if (ImGui::Button("Пресет TX (800/840 МГц)", ImVec2((left_width - 34) * 0.5f, 0)))
         {
             g_state.tx_freq_mhz = TX_MODE_TX_FREQ;
@@ -749,7 +845,6 @@ int main(int argc, char *argv[])
             g_state.rebuild_tx = true;
         }
 
-        // Кнопка Подключиться / Отключиться
         if (!want_conn)
         {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.10f, 0.55f, 0.30f, 1.0f));
@@ -864,8 +959,8 @@ int main(int argc, char *argv[])
         ImGui::Separator();
         ImGui::Spacing();
 
-        // 4. СОЗВЕЗДИЕ
-        ImGui::TextColored(ImVec4(0.0f, 0.82f, 0.95f, 1.0f), "НАСТРОЙКИ СОЗВЕЗДИЯ");
+        // 4. СИМВОЛЬНАЯ СИНХРОНИЗАЦИЯ И СОЗВЕЗДИЕ
+        ImGui::TextColored(ImVec4(0.0f, 0.82f, 0.95f, 1.0f), "СИМВОЛЬНАЯ СИНХРА И СОЗВЕЗДИЕ");
         ImGui::Spacing();
 
         int pts = g_state.constellation_pts.load();
@@ -873,13 +968,20 @@ int main(int argc, char *argv[])
             g_state.constellation_pts = pts;
 
         bool decimate = g_state.decimate_by_sps.load();
-        if (ImGui::Checkbox("Прореживание по SPS (строб)", &decimate))
+        if (ImGui::Checkbox("Прореживание по SPS", &decimate))
             g_state.decimate_by_sps = decimate;
+
+        ImGui::SameLine();
+        bool auto_sync = g_state.auto_symbol_sync.load();
+        if (ImGui::Checkbox("Авто Гарднер", &auto_sync))
+            g_state.auto_symbol_sync = auto_sync;
 
         int strobe = g_state.strobe_phase.load();
         int max_strobe = std::max(0, g_state.sps.load() - 1);
+        if (auto_sync) ImGui::BeginDisabled();
         if (ImGui::SliderInt("Фаза строба", &strobe, 0, max_strobe))
             g_state.strobe_phase = strobe;
+        if (auto_sync) ImGui::EndDisabled();
 
         float phase_rot = g_state.phase_rot_deg.load();
         if (ImGui::SliderFloat("Поворот фазы (°)", &phase_rot, -180.0f, 180.0f, "%.1f°"))
@@ -896,23 +998,24 @@ int main(int argc, char *argv[])
 
         ImGui::SameLine();
 
-        // --- ПРАВАЯ ПАНЕЛЬ: СОЗВЕЗДИЕ И ОСЦИЛЛОГРАММА ---
+        // --- ПРАВАЯ ПАНЕЛЬ: СОЗВЕЗДИЕ И S-КРИВАЯ ГАРДНЕРА ---
         ImGui::BeginChild("PlotsPanel", ImVec2(0, 0), true);
 
         {
             std::lock_guard<std::mutex> lock(g_state.iq_mutex);
-            local_i = g_state.iq_i;
-            local_q = g_state.iq_q;
-            local_wi = g_state.wave_i;
-            local_wq = g_state.wave_q;
+            local_i        = g_state.iq_i;
+            local_q        = g_state.iq_q;
+            local_wi       = g_state.wave_i;
+            local_wq       = g_state.wave_q;
+            local_g_phases = g_state.gardner_phases;
+            local_g_errors = g_state.gardner_errors;
         }
 
         float avail_h = ImGui::GetContentRegionAvail().y;
-        float const_h = avail_h * 0.70f;
-        float wave_h  = avail_h - const_h - 10.0f;
+        float const_h = avail_h * 0.66f;
 
         double lim = (double)g_state.plot_scale.load();
-        if (ImPlot::BeginPlot("Сигнальное созвездие (I / Q)", ImVec2(-1, const_h), ImPlotFlags_Equal))
+        if (ImPlot::BeginPlot("Сигнальное созвездие после согласованного фильтра (I / Q)", ImVec2(-1, const_h), ImPlotFlags_Equal))
         {
             ImPlot::SetupAxes("Синфазная составляющая I (Re)", "Квадратурная составляющая Q (Im)");
             ImPlot::SetupAxisLimits(ImAxis_X1, -lim, lim, ImGuiCond_Always);
@@ -925,25 +1028,56 @@ int main(int argc, char *argv[])
 
             if (!local_i.empty())
             {
-                ImPlot::PlotScatter("Принятые символы", local_i.data(), local_q.data(), (int)local_i.size());
+                ImPlot::PlotScatter("Символы", local_i.data(), local_q.data(), (int)local_i.size());
             }
 
             ImPlot::EndPlot();
         }
 
-        if (ImPlot::BeginPlot("Принятый сигнал во времени (первые 250 отсчётов)", ImVec2(-1, wave_h)))
+        if (ImGui::BeginTabBar("BottomPlotsTabs"))
         {
-            ImPlot::SetupAxes("Отсчёт (n)", "Амплитуда");
-            ImPlot::SetupAxisLimits(ImAxis_X1, 0, 250, ImGuiCond_Always);
-            ImPlot::SetupAxisLimits(ImAxis_Y1, -lim, lim, ImGuiCond_Always);
-
-            if (!local_wi.empty())
+            if (ImGui::BeginTabItem("S-кривая Гарднера (символьная синхра)"))
             {
-                ImPlot::PlotLine("I (Re)", local_wi.data(), (int)local_wi.size());
-                ImPlot::PlotLine("Q (Im)", local_wq.data(), (int)local_wq.size());
+                if (ImPlot::BeginPlot("Ошибка Гарднера от фазы стробирования", ImVec2(-1, -1)))
+                {
+                    int cur_sps = g_state.sps.load();
+                    ImPlot::SetupAxes("Фаза (сдвиг отсчёта)", "Средняя ошибка e", ImPlotAxisFlags_AutoFit, ImPlotAxisFlags_AutoFit);
+                    ImPlot::SetupAxisLimits(ImAxis_X1, 0, std::max(1, cur_sps - 1), ImGuiCond_Always);
+
+                    double x_zero[2] = {0.0, (double)std::max(1, cur_sps - 1)};
+                    double y_zero[2] = {0.0, 0.0};
+                    ImPlot::PlotLine("##zeroline", x_zero, y_zero, 2);
+
+                    if (!local_g_phases.empty())
+                    {
+                        ImPlot::PlotLine("S-кривая e(tau)", local_g_phases.data(), local_g_errors.data(), (int)local_g_phases.size());
+                    }
+
+                    ImPlot::EndPlot();
+                }
+                ImGui::EndTabItem();
             }
 
-            ImPlot::EndPlot();
+            if (ImGui::BeginTabItem("Сигнал после фильтра во времени"))
+            {
+                if (ImPlot::BeginPlot("Принятый сигнал во времени (первые 250 отсчётов)", ImVec2(-1, -1)))
+                {
+                    ImPlot::SetupAxes("Отсчёт (n)", "Амплитуда");
+                    ImPlot::SetupAxisLimits(ImAxis_X1, 0, 250, ImGuiCond_Always);
+                    ImPlot::SetupAxisLimits(ImAxis_Y1, -lim, lim, ImGuiCond_Always);
+
+                    if (!local_wi.empty())
+                    {
+                        ImPlot::PlotLine("I (Re)", local_wi.data(), (int)local_wi.size());
+                        ImPlot::PlotLine("Q (Im)", local_wq.data(), (int)local_wq.size());
+                    }
+
+                    ImPlot::EndPlot();
+                }
+                ImGui::EndTabItem();
+            }
+
+            ImGui::EndTabBar();
         }
 
         ImGui::EndChild();
