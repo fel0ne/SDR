@@ -1,5 +1,5 @@
-// Передача BPSK / QPSK сообщения между двумя Adalm Pluto по эфиру, в обе стороны.
-// Многопоточная версия с графическим интерфейсом (ImGui + ImPlot) и символьной синхронизацией Гарднера.
+// Передача BPSK / QPSK сообщения между двумя Adalm Pluto по эфиру + воспроизведение из .pcm с таймлайном.
+// Многопоточная версия с графическим интерфейсом (ImGui + ImPlot), синхронизацией Гарднера и петлёй Костаса.
 
 #include <SoapySDR/Device.h>
 #include <SoapySDR/Formats.h>
@@ -19,6 +19,7 @@
 #include <atomic>
 #include <algorithm>
 #include <chrono>
+#include <fstream>
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -44,6 +45,9 @@ struct SharedState {
     std::atomic<bool> want_connected{false};
     std::atomic<bool> sdr_connected{false};
 
+    // Источник данных: 0 = PlutoSDR, 1 = Файл .pcm
+    std::atomic<int>  source_mode{0};
+
     std::atomic<bool> tx_enabled{true};
     std::atomic<bool> record_pcm{false};
 
@@ -52,6 +56,7 @@ struct SharedState {
     std::string device_uri = "ip:192.168.2.1";
     std::string mode_tag   = "tx";
     std::string tx_message = TX_MODE_MSG;
+    std::string pcm_path   = "../recorded_data/QPSK/rx_recv.pcm";
 
     // Параметры модуляции и TX DSP
     std::atomic<int>  use_qpsk{0};       // 0 = BPSK, 1 = QPSK
@@ -66,20 +71,45 @@ struct SharedState {
     std::atomic<float> rx_freq_mhz{840.0f}; // МГц
     std::atomic<float> tx_freq_mhz{800.0f}; // МГц
 
-    // Параметры символьной синхронизации и созвездия
+    // Параметры синхронизации и созвездия
     std::atomic<int>   constellation_pts{1000};
+    std::atomic<bool>  coarse_cfo_comp{true};  // Грубый снос CFO до фильтра/Костаса
     std::atomic<bool>  auto_symbol_sync{true}; // Автовыбор фазы по Гарднеру
     std::atomic<int>   strobe_phase{5};        // 0 .. sps-1
     std::atomic<bool>  decimate_by_sps{true};
+    std::atomic<bool>  costas_enabled{true};   // Петля Костаса 2-го порядка
+    std::atomic<int>   costas_mode{1};         // 0 = BPSK (Re*Im), 1 = QPSK
+    std::atomic<float> costas_alpha{0.132f};
+    std::atomic<float> costas_beta{0.00932f};
+    std::atomic<bool>  costas_reset{false};
     std::atomic<float> phase_rot_deg{0.0f};    // Ручной доворот фазы (-180..180)
-    std::atomic<float> plot_scale{2200.0f};    // Предел осей I/Q
+    std::atomic<float> plot_scale{1500.0f};    // Предел осей I/Q
 
-    // Телеметрия от SDR -> GUI
+    // Состояние петли Костаса между блоками
+    double costas_phase = 0.0;
+    double costas_freq  = 0.0;
+
+    // Данные и состояние плеера файлов (.pcm)
+    std::mutex file_mutex;
+    std::vector<int16_t> file_iq;          // Чередующиеся I, Q
+    std::vector<double>  timeline_x_ms;    // Время (мс) для обзорного графика таймлайна
+    std::vector<double>  timeline_env;     // Огибающая амплитуды для таймлайна
+    std::atomic<size_t>  file_total_samples{0};
+    std::atomic<size_t>  play_pos{0};      // Текущая позиция (в отсчётах)
+    std::atomic<size_t>  loop_start{0};    // Начало зацикленного фрагмента
+    std::atomic<size_t>  loop_end{0};      // Конец зацикленного фрагмента
+    std::atomic<bool>    file_playing{false};
+    std::atomic<bool>    loop_enabled{true};
+    std::atomic<int>     file_chunk_size{10000}; // Размер блока обработки (отсчётов)
+    std::atomic<float>   playback_speed{1.0f};   // Множитель скорости (0.05x .. 5.0x)
+    std::atomic<bool>    scrub_dirty{false};     // Пересчитать кадр при ручной перемотке на паузе
+
+    // Телеметрия -> GUI
     std::atomic<int>    rx_peak{0};
     std::atomic<double> cfo_khz{0.0};
 
     std::mutex status_mutex;
-    std::string status_text = "Отключено. Введите URI PlutoSDR и нажмите «Подключиться»";
+    std::string status_text = "Отключено. Выберите PlutoSDR или загрузите .pcm файл";
 
     // Буферы для графиков
     std::mutex iq_mutex;
@@ -89,9 +119,11 @@ struct SharedState {
     std::vector<double> wave_q;
     std::vector<double> gardner_phases;
     std::vector<double> gardner_errors;
+    std::vector<double> costas_freq_log;
 };
 
 static SharedState g_state;
+static char g_pcm_path_input[512] = "../recorded_data/QPSK/rx_recv.pcm";
 
 static void on_sigint(int sig)
 {
@@ -110,8 +142,121 @@ static void clear_iq_buffers()
     g_state.wave_q.clear();
     g_state.gardner_phases.clear();
     g_state.gardner_errors.clear();
+    g_state.costas_freq_log.clear();
     g_state.rx_peak = 0;
     g_state.cfo_khz = 0.0;
+    g_state.costas_reset = true;
+}
+
+// ================= ЗАГРУЗКА .PCM ФАЙЛА И ПОСТРОЕНИЕ ТАЙМЛАЙНА =================
+
+static bool load_pcm_file(const std::string &path)
+{
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f.is_open())
+    {
+        std::lock_guard<std::mutex> lock(g_state.status_mutex);
+        g_state.status_text = "Ошибка: не удалось открыть файл " + path;
+        return false;
+    }
+
+    std::streamsize byte_size = f.tellg();
+    f.seekg(0, std::ios::beg);
+
+    size_t total_i16 = (size_t)(byte_size / sizeof(int16_t));
+    total_i16 = (total_i16 / 2) * 2;
+
+    if (total_i16 < 4)
+    {
+        std::lock_guard<std::mutex> lock(g_state.status_mutex);
+        g_state.status_text = "Ошибка: файл слишком короткий или пустой";
+        return false;
+    }
+
+    std::vector<int16_t> raw(total_i16);
+    if (!f.read(reinterpret_cast<char *>(raw.data()), total_i16 * sizeof(int16_t)))
+    {
+        std::lock_guard<std::mutex> lock(g_state.status_mutex);
+        g_state.status_text = "Ошибка чтения данных из " + path;
+        return false;
+    }
+
+    size_t num_samples = total_i16 / 2;
+
+    // Автовыбор режима детектора Костаса по имени папки/файла (если содержит BPSK -> 0, иначе QPSK -> 1)
+    if (path.find("BPSK") != std::string::npos || path.find("bpsk") != std::string::npos)
+        g_state.costas_mode = 0;
+    else if (path.find("QPSK") != std::string::npos || path.find("qpsk") != std::string::npos)
+        g_state.costas_mode = 1;
+
+    // Строим обзорную огибающую для таймлайна (до 2000 точек)
+    const size_t max_bins = 2000;
+    size_t bin_size = std::max<size_t>(1, num_samples / max_bins);
+    size_t num_bins = (num_samples + bin_size - 1) / bin_size;
+
+    std::vector<double> t_ms(num_bins);
+    std::vector<double> env(num_bins);
+
+    for (size_t b = 0; b < num_bins; b++)
+    {
+        size_t s0 = b * bin_size;
+        size_t s1 = std::min(num_samples, s0 + bin_size);
+        double max_mag = 0.0;
+        for (size_t i = s0; i < s1; i++)
+        {
+            double vi = (double)raw[2 * i];
+            double vq = (double)raw[2 * i + 1];
+            double mag = sqrt(vi * vi + vq * vq);
+            if (mag > max_mag)
+                max_mag = mag;
+        }
+        t_ms[b] = ((double)s0 / SAMPLE_RATE) * 1000.0;
+        env[b]  = max_mag;
+    }
+
+    g_state.want_connected = false;
+    g_state.source_mode = 1;
+
+    {
+        std::lock_guard<std::mutex> lock(g_state.file_mutex);
+        g_state.file_iq = std::move(raw);
+        g_state.timeline_x_ms = std::move(t_ms);
+        g_state.timeline_env = std::move(env);
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_state.cfg_mutex);
+        g_state.pcm_path = path;
+    }
+
+    g_state.file_total_samples = num_samples;
+    g_state.loop_start = 0;
+    g_state.loop_end   = num_samples;
+    g_state.play_pos   = 0;
+    g_state.file_playing = true;
+    g_state.scrub_dirty  = true;
+
+    clear_iq_buffers();
+
+    {
+        std::lock_guard<std::mutex> lock(g_state.status_mutex);
+        char buf[256];
+        snprintf(buf, sizeof(buf), "Файл загружен: %zu отсчётов (%.2f мс)",
+                 num_samples, ((double)num_samples / SAMPLE_RATE) * 1000.0);
+        g_state.status_text = std::string(buf) + " — " + path;
+    }
+
+    return true;
+}
+
+static void glfw_drop_callback(GLFWwindow *window, int count, const char **paths)
+{
+    (void)window;
+    if (count > 0 && paths[0])
+    {
+        strncpy(g_pcm_path_input, paths[0], sizeof(g_pcm_path_input) - 1);
+        g_pcm_path_input[sizeof(g_pcm_path_input) - 1] = '\0';
+        load_pcm_file(g_pcm_path_input);
+    }
 }
 
 // ================= 4 ШАГА ПЕРЕДАТЧИКА =================
@@ -220,9 +365,75 @@ static std::vector<int16_t> build_tx_signal(const std::string &msg, int use_qpsk
     return signal_out;
 }
 
+// ================= ПЕТЛЯ КОСТАСА (2ND ORDER COSTAS LOOP) =================
+
+static void run_costas_loop(std::vector<Complex> &samples, double fs, bool reset_state, std::vector<double> &freq_log)
+{
+    size_t N = samples.size();
+    freq_log.clear();
+    if (N == 0)
+        return;
+
+    // Нормировка входной амплитуды к ~1.0 (как в Python-модели)
+    double sum_sq = 0.0;
+    for (size_t i = 0; i < N; i++)
+        sum_sq += std::norm(samples[i]);
+    double rms = sqrt(sum_sq / (double)N);
+    if (rms < 1e-9)
+        return;
+
+    if (reset_state || g_state.costas_reset.exchange(false))
+    {
+        g_state.costas_phase = 0.0;
+        g_state.costas_freq  = 0.0;
+    }
+
+    double phase = g_state.costas_phase;
+    double freq  = g_state.costas_freq;
+    double alpha = (double)g_state.costas_alpha.load();
+    double beta  = (double)g_state.costas_beta.load();
+    int mode     = g_state.costas_mode.load(); // 0 = BPSK, 1 = QPSK
+
+    std::vector<Complex> out(N);
+    freq_log.reserve(N);
+
+    for (size_t i = 0; i < N; i++)
+    {
+        Complex s = samples[i] / rms;
+        out[i] = s * std::exp(Complex(0.0, -phase));
+
+        double error = 0.0;
+        if (mode == 0)
+        {
+            // Точная формула из твоего Python-кода для BPSK
+            error = out[i].real() * out[i].imag();
+        }
+        else
+        {
+            // Стандартный детектор 2-го порядка для QPSK (4 точки)
+            double sgn_re = (out[i].real() >= 0.0) ? 1.0 : -1.0;
+            double sgn_im = (out[i].imag() >= 0.0) ? 1.0 : -1.0;
+            error = sgn_re * out[i].imag() - sgn_im * out[i].real();
+        }
+
+        freq += (beta * error);
+        freq_log.push_back(freq * fs / (2.0 * M_PI));
+        phase += freq + (alpha * error);
+
+        while (phase >= 2.0 * M_PI)
+            phase -= 2.0 * M_PI;
+        while (phase < 0.0)
+            phase += 2.0 * M_PI;
+
+        samples[i] = out[i] * rms;
+    }
+
+    g_state.costas_phase = phase;
+    g_state.costas_freq  = freq;
+}
+
 // ================= БЛОК СИМВОЛЬНОЙ СИНХРОНИЗАЦИИ (GARDNER TED) =================
 
-// Детектор временной ошибки Гарднера (как в pipi.py)
 static inline double gardner_ted(const std::vector<double> &x, const std::vector<double> &y, int k, int Ts, int tau_hat)
 {
     int prev = (int)((k - 1) * Ts + tau_hat);
@@ -232,31 +443,68 @@ static inline double gardner_ted(const std::vector<double> &x, const std::vector
     return x[mid] * (x[prev] - x[curr]) + y[mid] * (y[prev] - y[curr]);
 }
 
-// Согласованный фильтр (свёртка с прямоугольным импульсом длины sps) + поиск фазы строба по S-кривой Гарднера
-static void process_symbol_sync(const int16_t *rx_buffer, size_t num_samples, int sps)
+static void process_symbol_sync(const int16_t *rx_buffer, size_t num_samples, int sps, bool replace_constellation = false)
 {
     if (num_samples == 0 || sps < 2)
         return;
 
-    // 1. Входной комплексный буфер
+    // 1. Входной комплексный буфер + оценка пика и CFO
     std::vector<Complex> rx(num_samples);
-    for (size_t i = 0; i < num_samples; i++)
-        rx[i] = Complex((double)rx_buffer[2 * i], (double)rx_buffer[2 * i + 1]);
+    int local_peak = 0;
+    Complex rot(0.0, 0.0);
 
-    // 2. Согласованный фильтр: h = [1/sps, ..., 1/sps] (скользящее среднее длины sps)
-    std::vector<double> filt_i(num_samples, 0.0);
-    std::vector<double> filt_q(num_samples, 0.0);
+    for (size_t i = 0; i < num_samples; i++)
+    {
+        int16_t vi = rx_buffer[2 * i];
+        int16_t vq = rx_buffer[2 * i + 1];
+        if (abs(vi) > local_peak) local_peak = abs(vi);
+        if (abs(vq) > local_peak) local_peak = abs(vq);
+        rx[i] = Complex((double)vi, (double)vq);
+        if (i > 0)
+            rot += rx[i] * conj(rx[i - 1]);
+    }
+
+    double cfo_rad = (num_samples > 1 && std::abs(rot) > 0.0) ? std::arg(rot) : 0.0;
+    if (replace_constellation)
+    {
+        g_state.rx_peak = local_peak;
+        g_state.cfo_khz = cfo_rad * SAMPLE_RATE / (2.0 * M_PI) / 1e3;
+    }
+
+    // 1.5. Грубый снос CFO до согласованного фильтра, чтобы фильтр не резал сигнал и Костас попал в полосу захвата
+    if (g_state.coarse_cfo_comp.load() && num_samples > 1)
+    {
+        for (size_t i = 0; i < num_samples; i++)
+            rx[i] *= std::exp(Complex(0.0, -cfo_rad * (double)i));
+    }
+
+    // 2. Согласованный фильтр: скользящее среднее длины sps
+    std::vector<Complex> filt(num_samples, Complex(0.0, 0.0));
     Complex acc(0.0, 0.0);
     for (size_t n = 0; n < num_samples; n++)
     {
         acc += rx[n];
         if (n >= (size_t)sps)
             acc -= rx[n - sps];
-        filt_i[n] = acc.real() / (double)sps;
-        filt_q[n] = acc.imag() / (double)sps;
+        filt[n] = acc / (double)sps;
     }
 
-    // 3. Расчёт S-кривой ошибки Гарднера по всем фазам tau_hat = 0 .. sps-1
+    // 3. Петля Костаса на полных отсчётах (fs = SAMPLE_RATE) ДО прореживания по SPS
+    std::vector<double> freq_log;
+    if (g_state.costas_enabled.load())
+    {
+        run_costas_loop(filt, SAMPLE_RATE, replace_constellation, freq_log);
+    }
+
+    std::vector<double> filt_i(num_samples);
+    std::vector<double> filt_q(num_samples);
+    for (size_t n = 0; n < num_samples; n++)
+    {
+        filt_i[n] = filt[n].real();
+        filt_q[n] = filt[n].imag();
+    }
+
+    // 4. Расчёт S-кривой ошибки Гарднера по всем фазам tau_hat = 0 .. sps-1
     std::vector<double> phases(sps);
     std::vector<double> s_curve(sps, 0.0);
     int num_symbols = (int)(num_samples / sps) - 1;
@@ -281,7 +529,7 @@ static void process_symbol_sync(const int16_t *rx_buffer, size_t num_samples, in
         }
     }
 
-    // 4. Поиск оптимальной фазы стробирования (переход S-кривой через ноль с отрицательным наклоном или минимум |e|)
+    // 5. Поиск оптимальной фазы стробирования
     int best_phase = g_state.strobe_phase.load() % sps;
     if (g_state.auto_symbol_sync.load() && num_symbols > 2)
     {
@@ -316,17 +564,23 @@ static void process_symbol_sync(const int16_t *rx_buffer, size_t num_samples, in
         g_state.strobe_phase = best_phase;
     }
 
-    // 5. Прореживание отфильтрованного сигнала с найденной фазой и доворот фазы созвездия
+    // 6. Прореживание отфильтрованного сигнала с найденной фазой + ручной доворот
     int max_pts = g_state.constellation_pts.load();
     bool decimate = g_state.decimate_by_sps.load();
+    int step   = (decimate && sps > 1) ? sps : 1;
+    int offset = (decimate && sps > 1) ? (best_phase % sps) : 0;
+
     float rot_rad = g_state.phase_rot_deg.load() * (float)M_PI / 180.0f;
     double cos_r = cos(rot_rad);
     double sin_r = sin(rot_rad);
 
-    int step   = (decimate && sps > 1) ? sps : 1;
-    int offset = (decimate && sps > 1) ? (best_phase % sps) : 0;
-
     std::lock_guard<std::mutex> lock(g_state.iq_mutex);
+
+    if (replace_constellation)
+    {
+        g_state.iq_i.clear();
+        g_state.iq_q.clear();
+    }
 
     for (size_t i = offset; i < num_samples; i += step)
     {
@@ -344,21 +598,143 @@ static void process_symbol_sync(const int16_t *rx_buffer, size_t num_samples, in
         g_state.iq_q.erase(g_state.iq_q.begin(), g_state.iq_q.begin() + excess);
     }
 
-    // Сохраняем S-кривую и осциллограмму после согласованного фильтра
     g_state.gardner_phases = phases;
     g_state.gardner_errors = s_curve;
+    if (!freq_log.empty())
+        g_state.costas_freq_log = std::move(freq_log);
 
     size_t wave_len = std::min<size_t>(num_samples, 250);
     g_state.wave_i.assign(filt_i.begin(), filt_i.begin() + wave_len);
     g_state.wave_q.assign(filt_q.begin(), filt_q.begin() + wave_len);
 }
 
-// ================= ФОНОВЫЙ ПОТОК SDR =================
+// ================= ФОНОВЫЙ ПОТОК: PLUTOSDR ИЛИ ФАЙЛОВЫЙ ПЛЕЕР =================
+
+static void process_file_step(bool is_scrubbing)
+{
+    size_t total = g_state.file_total_samples.load();
+    if (total == 0)
+        return;
+
+    size_t l_start = std::min(g_state.loop_start.load(), total - 1);
+    size_t l_end   = std::clamp(g_state.loop_end.load(), l_start + 1, total);
+    size_t pos     = g_state.play_pos.load();
+
+    if (pos < l_start || pos >= l_end)
+        pos = l_start;
+
+    size_t chunk = (size_t)std::max(64, g_state.file_chunk_size.load());
+    size_t avail = l_end - pos;
+    size_t count = std::min(chunk, avail);
+
+    std::vector<int16_t> slice_buf;
+    {
+        std::lock_guard<std::mutex> lock(g_state.file_mutex);
+        if (g_state.file_iq.size() < total * 2)
+            return;
+
+        slice_buf.reserve(chunk * 2);
+        slice_buf.insert(slice_buf.end(),
+                         g_state.file_iq.begin() + pos * 2,
+                         g_state.file_iq.begin() + (pos + count) * 2);
+
+        if (count < chunk && g_state.loop_enabled.load() && (l_end - l_start) > 0)
+        {
+            size_t rem = chunk - count;
+            size_t loop_len = l_end - l_start;
+            while (rem > 0)
+            {
+                size_t take = std::min(rem, loop_len);
+                slice_buf.insert(slice_buf.end(),
+                                 g_state.file_iq.begin() + l_start * 2,
+                                 g_state.file_iq.begin() + (l_start + take) * 2);
+                rem -= take;
+            }
+        }
+    }
+
+    size_t actual_samples = slice_buf.size() / 2;
+    if (actual_samples > 0)
+    {
+        process_symbol_sync(slice_buf.data(), actual_samples, g_state.sps.load(), is_scrubbing);
+
+        if (!is_scrubbing)
+        {
+            int peak = 0;
+            Complex rot(0.0, 0.0);
+            for (size_t i = 0; i < actual_samples; i++)
+            {
+                int16_t vi = slice_buf[2 * i];
+                int16_t vq = slice_buf[2 * i + 1];
+                if (abs(vi) > peak) peak = abs(vi);
+                if (abs(vq) > peak) peak = abs(vq);
+                if (i > 0)
+                {
+                    Complex cur(vi, vq);
+                    Complex prev(slice_buf[2 * (i - 1)], slice_buf[2 * (i - 1) + 1]);
+                    rot += cur * conj(prev);
+                }
+            }
+            g_state.rx_peak = peak;
+            g_state.cfo_khz = std::arg(rot) * SAMPLE_RATE / (2.0 * M_PI) / 1e3;
+        }
+    }
+
+    if (!is_scrubbing)
+    {
+        size_t next_pos = pos + chunk;
+        if (next_pos >= l_end)
+        {
+            if (g_state.loop_enabled.load())
+            {
+                size_t loop_len = std::max<size_t>(1, l_end - l_start);
+                next_pos = l_start + ((next_pos - l_start) % loop_len);
+            }
+            else
+            {
+                next_pos = l_end;
+                g_state.file_playing = false;
+            }
+        }
+        g_state.play_pos = next_pos;
+    }
+}
 
 static void sdr_worker()
 {
     while (g_state.app_running)
     {
+        // --- ВЕТКА 1: РЕЖИМ ВОСПРОИЗВЕДЕНИЯ ИЗ ФАЙЛА (.PCM) ---
+        if (g_state.source_mode.load() == 1)
+        {
+            bool playing = g_state.file_playing.load();
+            bool dirty   = g_state.scrub_dirty.exchange(false);
+
+            if (playing)
+            {
+                auto t0 = std::chrono::steady_clock::now();
+                process_file_step(false);
+
+                float speed = std::max(0.05f, g_state.playback_speed.load());
+                double chunk_sec = (double)g_state.file_chunk_size.load() / SAMPLE_RATE;
+                auto target_dur = std::chrono::microseconds((int64_t)((chunk_sec / speed) * 1e6));
+                auto elapsed = std::chrono::steady_clock::now() - t0;
+                if (target_dur > elapsed)
+                    std::this_thread::sleep_for(target_dur - elapsed);
+            }
+            else if (dirty)
+            {
+                process_file_step(true);
+                std::this_thread::sleep_for(std::chrono::milliseconds(16));
+            }
+            else
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+            continue;
+        }
+
+        // --- ВЕТКА 2: РЕЖИМ PLUTOSDR ---
         if (!g_state.want_connected)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -478,9 +854,8 @@ static void sdr_worker()
         int peak = 0;
         Complex rot(0.0, 0.0);
 
-        for (size_t buffers_read = 0; g_state.app_running && g_state.want_connected; buffers_read++)
+        for (size_t buffers_read = 0; g_state.app_running && g_state.want_connected && g_state.source_mode.load() == 0; buffers_read++)
         {
-            // 1. Обновляем RF параметры при изменении слайдеров
             float req_rx_gain = g_state.rx_gain.load();
             if (fabsf(req_rx_gain - applied_rx_gain) > 0.05f)
             {
@@ -509,7 +884,6 @@ static void sdr_worker()
                 applied_tx_freq = req_tx_freq;
             }
 
-            // 2. Пересобираем передаваемый сигнал при изменении сообщения или параметров модуляции
             if (g_state.rebuild_tx.exchange(false))
             {
                 std::string msg_copy;
@@ -523,7 +897,6 @@ static void sdr_worker()
                 sig_pos = 0;
             }
 
-            // 3. Запись PCM
             bool rec = g_state.record_pcm.load();
             if (rec && !was_recording)
             {
@@ -538,7 +911,6 @@ static void sdr_worker()
                 was_recording = false;
             }
 
-            // 4. ПРИЁМ И СИМВОЛЬНАЯ СИНХРОНИЗАЦИЯ
             void *rx_buffs[] = {rx_buffer.data()};
             int flags;
             long long timeNs;
@@ -562,7 +934,7 @@ static void sdr_worker()
 
             if (buffers_read % 2 == 0)
             {
-                process_symbol_sync(rx_buffer.data(), sr, cur_sps);
+                process_symbol_sync(rx_buffer.data(), sr, cur_sps, false);
             }
 
             if (buffers_read % 50 == 0)
@@ -573,7 +945,6 @@ static void sdr_worker()
                 rot = Complex(0.0, 0.0);
             }
 
-            // 5. ПЕРЕДАЧА
             long long tx_time = timeNs + (4 * 1000 * 1000);
             for (size_t i = 0; i < 8; i++)
             {
@@ -637,6 +1008,7 @@ static void sdr_worker()
 
         g_state.sdr_connected = false;
         clear_iq_buffers();
+        if (g_state.source_mode.load() == 0)
         {
             std::lock_guard<std::mutex> lock(g_state.status_mutex);
             g_state.status_text = "Отключено от " + uri;
@@ -720,7 +1092,7 @@ int main(int argc, char *argv[])
     if (!glfwInit())
         return -1;
 
-    GLFWwindow *window = glfwCreateWindow(1320, 820, "PlutoSDR BPSK / QPSK Трансивер", nullptr, nullptr);
+    GLFWwindow *window = glfwCreateWindow(1420, 920, "PlutoSDR BPSK / QPSK Трансивер & Анализатор .PCM", nullptr, nullptr);
     if (!window)
     {
         glfwTerminate();
@@ -729,6 +1101,7 @@ int main(int argc, char *argv[])
 
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
+    glfwSetDropCallback(window, glfw_drop_callback);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -758,6 +1131,8 @@ int main(int argc, char *argv[])
     std::vector<double> local_i, local_q;
     std::vector<double> local_wi, local_wq;
     std::vector<double> local_g_phases, local_g_errors;
+    std::vector<double> local_costas_freq;
+    std::vector<double> local_tl_ms, local_tl_env;
 
     while (!glfwWindowShouldClose(window) && g_state.app_running)
     {
@@ -783,8 +1158,9 @@ int main(int argc, char *argv[])
                 std::lock_guard<std::mutex> lock(g_state.status_mutex);
                 st = g_state.status_text;
             }
-            bool conn = g_state.sdr_connected.load();
-            ImVec4 led_col = conn ? ImVec4(0.15f, 0.90f, 0.45f, 1.0f) : ImVec4(0.90f, 0.25f, 0.25f, 1.0f);
+            int src_mode = g_state.source_mode.load();
+            bool active = (src_mode == 0) ? g_state.sdr_connected.load() : (g_state.file_total_samples.load() > 0);
+            ImVec4 led_col = active ? ImVec4(0.15f, 0.90f, 0.45f, 1.0f) : ImVec4(0.90f, 0.25f, 0.25f, 1.0f);
 
             ImGui::TextColored(led_col, "●");
             ImGui::SameLine();
@@ -799,145 +1175,226 @@ int main(int argc, char *argv[])
         ImGui::Separator();
 
         // --- ЛЕВАЯ ПАНЕЛЬ УПРАВЛЕНИЯ ---
-        float left_width = 390.0f;
+        float left_width = 400.0f;
         ImGui::BeginChild("ControlsPanel", ImVec2(left_width, 0), true);
 
-        // 1. ПОДКЛЮЧЕНИЕ И СООБЩЕНИЕ
-        ImGui::TextColored(ImVec4(0.0f, 0.82f, 0.95f, 1.0f), "ПОДКЛЮЧЕНИЕ PLUTOSDR И СООБЩЕНИЕ");
+        // 0. ВЫБОР ИСТОЧНИКА СИГНАЛА
+        ImGui::TextColored(ImVec4(0.0f, 0.82f, 0.95f, 1.0f), "ИСТОЧНИК СИГНАЛА");
         ImGui::Spacing();
 
-        bool is_connected = g_state.sdr_connected.load();
-        bool want_conn    = g_state.want_connected.load();
-
-        ImGui::Text("Адрес PlutoSDR (URI):");
-        ImGui::SetNextItemWidth(-1);
-        if (is_connected) ImGui::BeginDisabled();
-        if (ImGui::InputText("##uri_input", uri_input, sizeof(uri_input)))
+        int src_mode = g_state.source_mode.load();
+        if (ImGui::RadioButton("PlutoSDR (Эфир)", &src_mode, 0))
         {
-            std::lock_guard<std::mutex> lock(g_state.cfg_mutex);
-            g_state.device_uri = uri_input;
-        }
-        if (is_connected) ImGui::EndDisabled();
-
-        if (ImGui::Button("Пресет TX (800/840 МГц)", ImVec2((left_width - 34) * 0.5f, 0)))
-        {
-            g_state.tx_freq_mhz = TX_MODE_TX_FREQ;
-            g_state.rx_freq_mhz = TX_MODE_RX_FREQ;
-            strncpy(msg_input, TX_MODE_MSG, sizeof(msg_input) - 1);
-            {
-                std::lock_guard<std::mutex> lock(g_state.cfg_mutex);
-                g_state.mode_tag = "tx";
-                g_state.tx_message = msg_input;
-            }
-            g_state.rebuild_tx = true;
+            g_state.source_mode = 0;
+            g_state.file_playing = false;
+            clear_iq_buffers();
         }
         ImGui::SameLine();
-        if (ImGui::Button("Пресет RX (840/800 МГц)", ImVec2(-1, 0)))
+        if (ImGui::RadioButton("Файл отсчётов (.pcm)", &src_mode, 1))
         {
-            g_state.tx_freq_mhz = RX_MODE_TX_FREQ;
-            g_state.rx_freq_mhz = RX_MODE_RX_FREQ;
-            strncpy(msg_input, RX_MODE_MSG, sizeof(msg_input) - 1);
-            {
-                std::lock_guard<std::mutex> lock(g_state.cfg_mutex);
-                g_state.mode_tag = "rx";
-                g_state.tx_message = msg_input;
-            }
-            g_state.rebuild_tx = true;
+            g_state.want_connected = false;
+            g_state.source_mode = 1;
+            if (g_state.file_total_samples.load() == 0)
+                load_pcm_file(g_pcm_path_input);
+            else
+                g_state.scrub_dirty = true;
         }
 
-        if (!want_conn)
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        if (src_mode == 1)
         {
+            // 1A. ИМПОРТ ФАЙЛА .PCM
+            ImGui::TextColored(ImVec4(0.0f, 0.82f, 0.95f, 1.0f), "ИМПОРТ ФАЙЛА (.PCM INT16 I/Q)");
+            ImGui::Spacing();
+
+            ImGui::Text("Путь к файлу (или перетащите в окно):");
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputText("##pcm_path", g_pcm_path_input, sizeof(g_pcm_path_input));
+
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.10f, 0.55f, 0.30f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.15f, 0.70f, 0.38f, 1.0f));
-            if (ImGui::Button("Подключиться к PlutoSDR", ImVec2(-1, 34)))
+            if (ImGui::Button("Загрузить .pcm файл", ImVec2(-1, 32)))
             {
-                std::lock_guard<std::mutex> lock(g_state.cfg_mutex);
-                g_state.device_uri = uri_input;
-                g_state.want_connected = true;
+                load_pcm_file(g_pcm_path_input);
             }
             ImGui::PopStyleColor(2);
+
+            size_t total_samp = g_state.file_total_samples.load();
+            if (total_samp > 0)
+            {
+                ImGui::Spacing();
+                int chunk = g_state.file_chunk_size.load();
+                if (ImGui::SliderInt("Окно анализа (отсч.)", &chunk, 512, 50000))
+                {
+                    g_state.file_chunk_size = chunk;
+                    if (!g_state.file_playing.load())
+                        g_state.scrub_dirty = true;
+                }
+
+                float spd = g_state.playback_speed.load();
+                if (ImGui::SliderFloat("Скорость воспроизв.", &spd, 0.05f, 5.0f, "%.2fx"))
+                    g_state.playback_speed = spd;
+            }
         }
         else
         {
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.65f, 0.18f, 0.18f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.80f, 0.22f, 0.22f, 1.0f));
-            if (ImGui::Button("Отключиться", ImVec2(-1, 34)))
+            // 1B. ПОДКЛЮЧЕНИЕ PLUTOSDR И СООБЩЕНИЕ
+            ImGui::TextColored(ImVec4(0.0f, 0.82f, 0.95f, 1.0f), "ПОДКЛЮЧЕНИЕ PLUTOSDR И СООБЩЕНИЕ");
+            ImGui::Spacing();
+
+            bool is_connected = g_state.sdr_connected.load();
+            bool want_conn    = g_state.want_connected.load();
+
+            ImGui::Text("Адрес PlutoSDR (URI):");
+            ImGui::SetNextItemWidth(-1);
+            if (is_connected) ImGui::BeginDisabled();
+            if (ImGui::InputText("##uri_input", uri_input, sizeof(uri_input)))
             {
-                g_state.want_connected = false;
+                std::lock_guard<std::mutex> lock(g_state.cfg_mutex);
+                g_state.device_uri = uri_input;
             }
-            ImGui::PopStyleColor(2);
+            if (is_connected) ImGui::EndDisabled();
+
+            if (ImGui::Button("Пресет TX (800/840 МГц)", ImVec2((left_width - 34) * 0.5f, 0)))
+            {
+                g_state.tx_freq_mhz = TX_MODE_TX_FREQ;
+                g_state.rx_freq_mhz = TX_MODE_RX_FREQ;
+                strncpy(msg_input, TX_MODE_MSG, sizeof(msg_input) - 1);
+                {
+                    std::lock_guard<std::mutex> lock(g_state.cfg_mutex);
+                    g_state.mode_tag = "tx";
+                    g_state.tx_message = msg_input;
+                }
+                g_state.rebuild_tx = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Пресет RX (840/800 МГц)", ImVec2(-1, 0)))
+            {
+                g_state.tx_freq_mhz = RX_MODE_TX_FREQ;
+                g_state.rx_freq_mhz = RX_MODE_RX_FREQ;
+                strncpy(msg_input, RX_MODE_MSG, sizeof(msg_input) - 1);
+                {
+                    std::lock_guard<std::mutex> lock(g_state.cfg_mutex);
+                    g_state.mode_tag = "rx";
+                    g_state.tx_message = msg_input;
+                }
+                g_state.rebuild_tx = true;
+            }
+
+            if (!want_conn)
+            {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.10f, 0.55f, 0.30f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.15f, 0.70f, 0.38f, 1.0f));
+                if (ImGui::Button("Подключиться к PlutoSDR", ImVec2(-1, 34)))
+                {
+                    std::lock_guard<std::mutex> lock(g_state.cfg_mutex);
+                    g_state.device_uri = uri_input;
+                    g_state.want_connected = true;
+                }
+                ImGui::PopStyleColor(2);
+            }
+            else
+            {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.65f, 0.18f, 0.18f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.80f, 0.22f, 0.22f, 1.0f));
+                if (ImGui::Button("Отключиться", ImVec2(-1, 34)))
+                {
+                    g_state.want_connected = false;
+                }
+                ImGui::PopStyleColor(2);
+            }
+
+            ImGui::Spacing();
+            ImGui::Text("Сообщение для передачи:");
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::InputText("##txmsg", msg_input, sizeof(msg_input)))
+            {
+                std::lock_guard<std::mutex> lock(g_state.cfg_mutex);
+                g_state.tx_message = msg_input;
+                g_state.rebuild_tx = true;
+            }
+
+            bool tx_en = g_state.tx_enabled.load();
+            if (ImGui::Checkbox("Передача TX активна", &tx_en))
+                g_state.tx_enabled = tx_en;
+
+            ImGui::SameLine();
+            bool rec_pcm = g_state.record_pcm.load();
+            if (ImGui::Checkbox("Писать .pcm", &rec_pcm))
+                g_state.record_pcm = rec_pcm;
+
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            // 2. РАДИОТРАКТ
+            ImGui::TextColored(ImVec4(0.0f, 0.82f, 0.95f, 1.0f), "РАДИОТРАКТ (RF)");
+            ImGui::Spacing();
+
+            float rx_gain = g_state.rx_gain.load();
+            if (ImGui::SliderFloat("Усиление RX (дБ)", &rx_gain, 0.0f, 70.0f, "%.1f дБ"))
+                g_state.rx_gain = rx_gain;
+
+            float tx_gain = g_state.tx_gain.load();
+            if (ImGui::SliderFloat("Усиление TX (дБ)", &tx_gain, -89.0f, 0.0f, "%.1f дБ"))
+                g_state.tx_gain = tx_gain;
+
+            float rx_freq = g_state.rx_freq_mhz.load();
+            if (ImGui::SliderFloat("Частота RX (МГц)", &rx_freq, 70.0f, 3000.0f, "%.2f МГц"))
+                g_state.rx_freq_mhz = rx_freq;
+
+            float tx_freq = g_state.tx_freq_mhz.load();
+            if (ImGui::SliderFloat("Частота TX (МГц)", &tx_freq, 70.0f, 3000.0f, "%.2f МГц"))
+                g_state.tx_freq_mhz = tx_freq;
+
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            // 3. МОДУЛЯЦИЯ
+            ImGui::TextColored(ImVec4(0.0f, 0.82f, 0.95f, 1.0f), "МОДУЛЯЦИЯ");
+            ImGui::Spacing();
+
+            int mod_type = g_state.use_qpsk.load();
+            if (ImGui::RadioButton("BPSK", &mod_type, 0))
+            {
+                g_state.use_qpsk = 0;
+                g_state.costas_mode = 0;
+                g_state.rebuild_tx = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("QPSK", &mod_type, 1))
+            {
+                g_state.use_qpsk = 1;
+                g_state.costas_mode = 1;
+                g_state.rebuild_tx = true;
+            }
+
+            int amp = g_state.amplitude.load();
+            if (ImGui::SliderInt("Амплитуда ЦАП", &amp, 0, 2047))
+            {
+                g_state.amplitude = amp;
+                g_state.rebuild_tx = true;
+            }
+
+            int gap = g_state.gap_symbols.load();
+            if (ImGui::SliderInt("Пауза (символов)", &gap, 0, 128))
+            {
+                g_state.gap_symbols = gap;
+                g_state.rebuild_tx = true;
+            }
         }
-
-        ImGui::Spacing();
-        ImGui::Text("Сообщение для передачи:");
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::InputText("##txmsg", msg_input, sizeof(msg_input)))
-        {
-            std::lock_guard<std::mutex> lock(g_state.cfg_mutex);
-            g_state.tx_message = msg_input;
-            g_state.rebuild_tx = true;
-        }
-
-        bool tx_en = g_state.tx_enabled.load();
-        if (ImGui::Checkbox("Передача TX активна", &tx_en))
-            g_state.tx_enabled = tx_en;
-
-        ImGui::SameLine();
-        bool rec_pcm = g_state.record_pcm.load();
-        if (ImGui::Checkbox("Писать .pcm", &rec_pcm))
-            g_state.record_pcm = rec_pcm;
 
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::Spacing();
 
-        // 2. РАДИОТРАКТ
-        ImGui::TextColored(ImVec4(0.0f, 0.82f, 0.95f, 1.0f), "РАДИОТРАКТ (RF)");
+        // 4. СИМВОЛЬНАЯ И ЧАСТОТНАЯ СИНХРОНИЗАЦИЯ
+        ImGui::TextColored(ImVec4(0.0f, 0.82f, 0.95f, 1.0f), "СИНХРОНИЗАЦИЯ И СОЗВЕЗДИЕ");
         ImGui::Spacing();
-
-        float rx_gain = g_state.rx_gain.load();
-        if (ImGui::SliderFloat("Усиление RX (дБ)", &rx_gain, 0.0f, 70.0f, "%.1f дБ"))
-            g_state.rx_gain = rx_gain;
-
-        float tx_gain = g_state.tx_gain.load();
-        if (ImGui::SliderFloat("Усиление TX (дБ)", &tx_gain, -89.0f, 0.0f, "%.1f дБ"))
-            g_state.tx_gain = tx_gain;
-
-        float rx_freq = g_state.rx_freq_mhz.load();
-        if (ImGui::SliderFloat("Частота RX (МГц)", &rx_freq, 70.0f, 3000.0f, "%.2f МГц"))
-            g_state.rx_freq_mhz = rx_freq;
-
-        float tx_freq = g_state.tx_freq_mhz.load();
-        if (ImGui::SliderFloat("Частота TX (МГц)", &tx_freq, 70.0f, 3000.0f, "%.2f МГц"))
-            g_state.tx_freq_mhz = tx_freq;
-
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
-
-        // 3. МОДУЛЯЦИЯ
-        ImGui::TextColored(ImVec4(0.0f, 0.82f, 0.95f, 1.0f), "МОДУЛЯЦИЯ");
-        ImGui::Spacing();
-
-        int mod_type = g_state.use_qpsk.load();
-        if (ImGui::RadioButton("BPSK", &mod_type, 0))
-        {
-            g_state.use_qpsk = 0;
-            g_state.rebuild_tx = true;
-        }
-        ImGui::SameLine();
-        if (ImGui::RadioButton("QPSK", &mod_type, 1))
-        {
-            g_state.use_qpsk = 1;
-            g_state.rebuild_tx = true;
-        }
-
-        int amp = g_state.amplitude.load();
-        if (ImGui::SliderInt("Амплитуда ЦАП", &amp, 0, 2047))
-        {
-            g_state.amplitude = amp;
-            g_state.rebuild_tx = true;
-        }
 
         int sps = g_state.sps.load();
         if (ImGui::SliderInt("Отсчетов на символ (SPS)", &sps, 2, 32))
@@ -946,49 +1403,107 @@ int main(int argc, char *argv[])
             if (g_state.strobe_phase >= sps)
                 g_state.strobe_phase = sps - 1;
             g_state.rebuild_tx = true;
+            if (src_mode == 1 && !g_state.file_playing.load())
+                g_state.scrub_dirty = true;
         }
-
-        int gap = g_state.gap_symbols.load();
-        if (ImGui::SliderInt("Пауза (символов)", &gap, 0, 128))
-        {
-            g_state.gap_symbols = gap;
-            g_state.rebuild_tx = true;
-        }
-
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
-
-        // 4. СИМВОЛЬНАЯ СИНХРОНИЗАЦИЯ И СОЗВЕЗДИЕ
-        ImGui::TextColored(ImVec4(0.0f, 0.82f, 0.95f, 1.0f), "СИМВОЛЬНАЯ СИНХРА И СОЗВЕЗДИЕ");
-        ImGui::Spacing();
 
         int pts = g_state.constellation_pts.load();
         if (ImGui::SliderInt("Точек на графике", &pts, 100, 4000))
+        {
             g_state.constellation_pts = pts;
+            if (src_mode == 1 && !g_state.file_playing.load())
+                g_state.scrub_dirty = true;
+        }
 
-        bool decimate = g_state.decimate_by_sps.load();
-        if (ImGui::Checkbox("Прореживание по SPS", &decimate))
-            g_state.decimate_by_sps = decimate;
-
+        bool coarse_cfo = g_state.coarse_cfo_comp.load();
+        if (ImGui::Checkbox("Грубый снос CFO", &coarse_cfo))
+        {
+            g_state.coarse_cfo_comp = coarse_cfo;
+            g_state.costas_reset = true;
+            if (src_mode == 1 && !g_state.file_playing.load())
+                g_state.scrub_dirty = true;
+        }
         ImGui::SameLine();
+        bool decimate = g_state.decimate_by_sps.load();
+        if (ImGui::Checkbox("Децимация SPS", &decimate))
+        {
+            g_state.decimate_by_sps = decimate;
+            if (src_mode == 1 && !g_state.file_playing.load())
+                g_state.scrub_dirty = true;
+        }
+
         bool auto_sync = g_state.auto_symbol_sync.load();
         if (ImGui::Checkbox("Авто Гарднер", &auto_sync))
+        {
             g_state.auto_symbol_sync = auto_sync;
+            if (src_mode == 1 && !g_state.file_playing.load())
+                g_state.scrub_dirty = true;
+        }
 
         int strobe = g_state.strobe_phase.load();
         int max_strobe = std::max(0, g_state.sps.load() - 1);
         if (auto_sync) ImGui::BeginDisabled();
         if (ImGui::SliderInt("Фаза строба", &strobe, 0, max_strobe))
+        {
             g_state.strobe_phase = strobe;
+            if (src_mode == 1 && !g_state.file_playing.load())
+                g_state.scrub_dirty = true;
+        }
         if (auto_sync) ImGui::EndDisabled();
+
+        // Петля Костаса
+        bool costas_on = g_state.costas_enabled.load();
+        if (ImGui::Checkbox("Петля Костаса", &costas_on))
+        {
+            g_state.costas_enabled = costas_on;
+            g_state.costas_reset = true;
+            if (src_mode == 1 && !g_state.file_playing.load())
+                g_state.scrub_dirty = true;
+        }
+        ImGui::SameLine();
+        int c_mode = g_state.costas_mode.load();
+        if (ImGui::RadioButton("BPSK##cm", &c_mode, 0))
+        {
+            g_state.costas_mode = 0;
+            g_state.costas_reset = true;
+            if (src_mode == 1 && !g_state.file_playing.load())
+                g_state.scrub_dirty = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::RadioButton("QPSK##cm", &c_mode, 1))
+        {
+            g_state.costas_mode = 1;
+            g_state.costas_reset = true;
+            if (src_mode == 1 && !g_state.file_playing.load())
+                g_state.scrub_dirty = true;
+        }
+
+        float c_alpha = g_state.costas_alpha.load();
+        if (ImGui::SliderFloat("Costas alpha", &c_alpha, 0.001f, 0.5f, "%.4f"))
+        {
+            g_state.costas_alpha = c_alpha;
+            if (src_mode == 1 && !g_state.file_playing.load())
+                g_state.scrub_dirty = true;
+        }
+
+        float c_beta = g_state.costas_beta.load();
+        if (ImGui::SliderFloat("Costas beta", &c_beta, 0.0001f, 0.05f, "%.5f"))
+        {
+            g_state.costas_beta = c_beta;
+            if (src_mode == 1 && !g_state.file_playing.load())
+                g_state.scrub_dirty = true;
+        }
 
         float phase_rot = g_state.phase_rot_deg.load();
         if (ImGui::SliderFloat("Поворот фазы (°)", &phase_rot, -180.0f, 180.0f, "%.1f°"))
+        {
             g_state.phase_rot_deg = phase_rot;
+            if (src_mode == 1 && !g_state.file_playing.load())
+                g_state.scrub_dirty = true;
+        }
 
         float scale = g_state.plot_scale.load();
-        if (ImGui::SliderFloat("Масштаб осей I/Q", &scale, 100.0f, 2200.0f, "%.0f"))
+        if (ImGui::SliderFloat("Масштаб осей I/Q", &scale, 100.0f, 3000.0f, "%.0f"))
             g_state.plot_scale = scale;
 
         if (ImGui::Button("Очистить график", ImVec2(-1, 0)))
@@ -998,21 +1513,151 @@ int main(int argc, char *argv[])
 
         ImGui::SameLine();
 
-        // --- ПРАВАЯ ПАНЕЛЬ: СОЗВЕЗДИЕ И S-КРИВАЯ ГАРДНЕРА ---
+        // --- ПРАВАЯ ПАНЕЛЬ: ТАЙМЛАЙН (ЕСЛИ ФАЙЛ), СОЗВЕЗДИЕ И НИЖНИЕ ВКЛАДКИ ---
         ImGui::BeginChild("PlotsPanel", ImVec2(0, 0), true);
 
         {
             std::lock_guard<std::mutex> lock(g_state.iq_mutex);
-            local_i        = g_state.iq_i;
-            local_q        = g_state.iq_q;
-            local_wi       = g_state.wave_i;
-            local_wq       = g_state.wave_q;
-            local_g_phases = g_state.gardner_phases;
-            local_g_errors = g_state.gardner_errors;
+            local_i           = g_state.iq_i;
+            local_q           = g_state.iq_q;
+            local_wi          = g_state.wave_i;
+            local_wq          = g_state.wave_q;
+            local_g_phases    = g_state.gardner_phases;
+            local_g_errors    = g_state.gardner_errors;
+            local_costas_freq = g_state.costas_freq_log;
+        }
+
+        // БЛОК ТАЙМЛАЙНА ДЛЯ РЕЖИМА ФАЙЛА
+        float timeline_block_h = 0.0f;
+        if (src_mode == 1)
+        {
+            size_t total_samp = g_state.file_total_samples.load();
+            timeline_block_h = 225.0f;
+
+            ImGui::BeginChild("TimelinePanel", ImVec2(-1, timeline_block_h), true);
+
+            if (total_samp == 0)
+            {
+                ImGui::TextDisabled("Файл .pcm не загружен. Укажите путь слева или перетащите файл в окно.");
+            }
+            else
+            {
+                {
+                    std::lock_guard<std::mutex> lock(g_state.file_mutex);
+                    local_tl_ms  = g_state.timeline_x_ms;
+                    local_tl_env = g_state.timeline_env;
+                }
+
+                bool playing = g_state.file_playing.load();
+                if (ImGui::Button(playing ? "Пауза" : "Пуск", ImVec2(75, 0)))
+                {
+                    if (!playing && g_state.play_pos.load() >= g_state.loop_end.load())
+                        g_state.play_pos = g_state.loop_start.load();
+                    g_state.file_playing = !playing;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("|< В начало", ImVec2(90, 0)))
+                {
+                    g_state.play_pos = g_state.loop_start.load();
+                    g_state.scrub_dirty = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("< Шаг", ImVec2(60, 0)))
+                {
+                    g_state.file_playing = false;
+                    size_t step = (size_t)std::max(1, g_state.file_chunk_size.load() / 4);
+                    size_t cur  = g_state.play_pos.load();
+                    size_t ls   = g_state.loop_start.load();
+                    g_state.play_pos = (cur > ls + step) ? (cur - step) : ls;
+                    g_state.scrub_dirty = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Шаг >", ImVec2(60, 0)))
+                {
+                    g_state.file_playing = false;
+                    size_t step = (size_t)std::max(1, g_state.file_chunk_size.load() / 4);
+                    size_t cur  = g_state.play_pos.load();
+                    size_t le   = g_state.loop_end.load();
+                    g_state.play_pos = std::min(le > 1 ? le - 1 : 0, cur + step);
+                    g_state.scrub_dirty = true;
+                }
+                ImGui::SameLine();
+                bool loop_on = g_state.loop_enabled.load();
+                if (ImGui::Checkbox("Зациклить", &loop_on))
+                    g_state.loop_enabled = loop_on;
+
+                ImGui::SameLine();
+                if (ImGui::Button("Весь файл"))
+                {
+                    g_state.loop_start = 0;
+                    g_state.loop_end   = total_samp;
+                    g_state.scrub_dirty = true;
+                }
+
+                size_t cur_pos = g_state.play_pos.load();
+                size_t l_start = g_state.loop_start.load();
+                size_t l_end   = g_state.loop_end.load();
+
+                ImGui::Text("Позиция: %zu / %zu (%.2f мс)   |   Зелёная (начало): %zu   |   Оранжевая (конец): %zu",
+                            cur_pos, total_samp, (cur_pos / SAMPLE_RATE) * 1000.0, l_start, l_end);
+
+                double total_ms = (total_samp / SAMPLE_RATE) * 1000.0;
+                double pos_ms   = (cur_pos / SAMPLE_RATE) * 1000.0;
+                double start_ms = (l_start / SAMPLE_RATE) * 1000.0;
+                double end_ms   = (l_end / SAMPLE_RATE) * 1000.0;
+
+                if (ImPlot::BeginPlot("##TimelinePlot", ImVec2(-1, -1), ImPlotFlags_NoTitle | ImPlotFlags_NoMenus))
+                {
+                    double pad = std::max(0.01, total_ms * 0.03);
+                    ImPlot::SetupAxes("Время (мс)", "Амплитуда", ImPlotAxisFlags_None, ImPlotAxisFlags_AutoFit);
+                    ImPlot::SetupAxisLimits(ImAxis_X1, -pad, total_ms + pad, ImGuiCond_Once);
+
+                    if (!local_tl_ms.empty())
+                    {
+                        ImPlot::PlotLine("Огибающая сигнала", local_tl_ms.data(), local_tl_env.data(), (int)local_tl_ms.size());
+                    }
+
+                    // 1. Зелёная линия — начало цикла (Loop Start)
+                    if (ImPlot::DragLineX(1, &start_ms, ImVec4(0.15f, 0.90f, 0.40f, 1.0f), 2.5f))
+                    {
+                        size_t new_start = (size_t)std::clamp(start_ms * 1e-3 * SAMPLE_RATE, 0.0, (double)(total_samp - 1));
+                        if (new_start >= l_end)
+                            new_start = (l_end > 1) ? (l_end - 1) : 0;
+                        g_state.loop_start = new_start;
+                        if (g_state.play_pos.load() < new_start)
+                            g_state.play_pos = new_start;
+                        g_state.scrub_dirty = true;
+                    }
+
+                    // 2. Оранжевая линия — конец цикла (Loop End)
+                    if (ImPlot::DragLineX(2, &end_ms, ImVec4(0.98f, 0.55f, 0.12f, 1.0f), 2.5f))
+                    {
+                        size_t new_end = (size_t)std::clamp(end_ms * 1e-3 * SAMPLE_RATE, 1.0, (double)total_samp);
+                        if (new_end <= l_start)
+                            new_end = std::min(total_samp, l_start + 1);
+                        g_state.loop_end = new_end;
+                        if (g_state.play_pos.load() >= new_end)
+                            g_state.play_pos = l_start;
+                        g_state.scrub_dirty = true;
+                    }
+
+                    // 3. Голубая линия — текущая позиция воспроизведения (Playhead)
+                    if (ImPlot::DragLineX(0, &pos_ms, ImVec4(0.00f, 0.88f, 1.00f, 1.0f), 2.5f))
+                    {
+                        size_t new_pos = (size_t)std::clamp(pos_ms * 1e-3 * SAMPLE_RATE, 0.0, (double)(total_samp - 1));
+                        g_state.play_pos = new_pos;
+                        g_state.scrub_dirty = true;
+                    }
+
+                    ImPlot::EndPlot();
+                }
+            }
+
+            ImGui::EndChild();
         }
 
         float avail_h = ImGui::GetContentRegionAvail().y;
-        float const_h = avail_h * 0.66f;
+        float const_h = avail_h * 0.65f;
 
         double lim = (double)g_state.plot_scale.load();
         if (ImPlot::BeginPlot("Сигнальное созвездие после согласованного фильтра (I / Q)", ImVec2(-1, const_h), ImPlotFlags_Equal))
@@ -1036,6 +1681,22 @@ int main(int argc, char *argv[])
 
         if (ImGui::BeginTabBar("BottomPlotsTabs"))
         {
+            if (ImGui::BeginTabItem("Петля Костаса (freq_log)"))
+            {
+                if (ImPlot::BeginPlot("Оценка частотного сдвига петли Костаса (Гц)", ImVec2(-1, -1)))
+                {
+                    ImPlot::SetupAxes("Отсчёт (i)", "Частота (Гц)", ImPlotAxisFlags_AutoFit, ImPlotAxisFlags_AutoFit);
+
+                    if (!local_costas_freq.empty())
+                    {
+                        ImPlot::PlotLine("freq_log (Гц)", local_costas_freq.data(), (int)local_costas_freq.size());
+                    }
+
+                    ImPlot::EndPlot();
+                }
+                ImGui::EndTabItem();
+            }
+
             if (ImGui::BeginTabItem("S-кривая Гарднера (символьная синхра)"))
             {
                 if (ImPlot::BeginPlot("Ошибка Гарднера от фазы стробирования", ImVec2(-1, -1)))
